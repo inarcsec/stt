@@ -57,6 +57,7 @@ ActivityRecorder::activity()
 {
     // If we've already recorded activity for this cycle, we don't
     // want to increment the count any more.
+    DPRINTF(Activity, "ActivityRecorder::activity() begin\n");
     if (activityBuffer[0]) {
         return;
     }
@@ -73,6 +74,7 @@ ActivityRecorder::advance()
 {
     // If there's a 1 in the slot that is about to be erased once the
     // time buffer advances, then decrement the activityCount.
+    DPRINTF(Activity, "ActivityRecorder::advance() begin\n");
     if (activityBuffer[-longestLatency]) {
         --activityCount;
 

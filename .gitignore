@@ -1,4 +1,5 @@
 build
+build_backup
 parser.out
 parsetab.py
 cscope.files
@@ -24,3 +25,17 @@ m5out
 /system/arm/simple_bootloader/boot.arm
 /system/arm/simple_bootloader/boot_emm.arm
 /system/arm/aarch64_bootloader/boot_emm.arm64
+*.rcS
+simpoint/*
+test_ckpt_instrs/*
+output/*
+output/checkpoints/*
+output/image/*
+output/condor/*
+output/outputs/*
+attack_code/*.[so]
+src/tags
+process_script/tmp*
+process_script/stat*
+figure/*
+script

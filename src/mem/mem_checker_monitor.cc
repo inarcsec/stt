@@ -296,7 +296,6 @@ MemCheckerMonitor::recvTimingResp(PacketPtr pkt)
 
                 panic_if(!warnOnly, "MemChecker violation!");
             }
-
             delete received_state;
         } else if (is_write) {
             DPRINTF(MemCheckerMonitor,

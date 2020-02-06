@@ -190,6 +190,7 @@ struct DefaultIEWDefaultCommit {
 
     DynInstPtr insts[Impl::MaxWidth];
     DynInstPtr mispredictInst[Impl::MaxThreads];
+    DynInstPtr instCausingSquash[Impl::MaxThreads];
     Addr mispredPC[Impl::MaxThreads];
     InstSeqNum squashedSeqNum[Impl::MaxThreads];
     TheISA::PCState pc[Impl::MaxThreads];

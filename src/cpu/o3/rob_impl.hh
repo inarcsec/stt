@@ -221,6 +221,21 @@ ROB<Impl>::insertInst(DynInstPtr &inst)
 
     ThreadID tid = inst->threadNumber;
 
+    /*** [Jiyong,STT] add logic for setting argProducers ***/
+    for (auto prevInstIt = instList[tid].begin(); prevInstIt != instList[tid].end(); prevInstIt++){
+        // find matched physical reg between prev instr and inst
+        DynInstPtr prevInst = (*prevInstIt);
+        for (int i = 0; i < inst->numSrcRegs(); i++) {
+            if (inst->srcRegIdx(i).index() == 16)   // exclude zero register (zero register cannot be tainted)
+                continue;
+            for (int j = 0; j < prevInst->numDestRegs(); j++){
+                if (inst->renamedSrcRegIdx(i) == prevInst->renamedDestRegIdx(j)){
+                    inst->setArgProducer(i, prevInst);
+                }
+            }
+        }
+    }
+
     instList[tid].push_back(inst);
 
     //Set Up head iterator if this is the 1st instruction in the ROB
@@ -242,6 +257,7 @@ ROB<Impl>::insertInst(DynInstPtr &inst)
     assert((*tail) == inst);
 
     DPRINTF(ROB, "[tid:%i] Now has %d instructions.\n", tid, threadEntries[tid]);
+
 }
 
 template <class Impl>
@@ -271,6 +287,20 @@ ROB<Impl>::retireHead(ThreadID tid)
 
     instList[tid].erase(head_it);
 
+    /*** [Jiyong,STT] add logic for clearing argProducers ***/
+    for (auto nextInstIt = std::next(instList[tid].begin()); nextInstIt != instList[tid].end(); nextInstIt++){
+        // find matched physical reg between head_inst and next instr
+        DynInstPtr nextInst = (*nextInstIt);
+        for (int i = 0; i < nextInst->numSrcRegs(); i++){
+            if (nextInst->getArgProducer(i) == head_inst)
+                nextInst->clearArgProducer(i);
+        }
+    }
+
+    // clear argProducer for head_inst
+    for (int i = 0; i < head_inst->numSrcRegs(); i++)
+        head_inst->clearArgProducer(i);
+
     //Update "Global" Head of ROB
     updateHead();
 
@@ -286,7 +316,8 @@ ROB<Impl>::isHeadReady(ThreadID tid)
 {
     robReads++;
     if (threadEntries[tid] != 0) {
-        return instList[tid].front()->readyToCommit();
+        return (instList[tid].front()->readyToCommit() &
+                instList[tid].front()->isLoadSafeToCommit());
     }
 
     return false;
@@ -362,6 +393,8 @@ ROB<Impl>::doSquash(ThreadID tid)
         // it can drain out of the pipeline.
         (*squashIt[tid])->setSquashed();
 
+        (*squashIt[tid])->hasPendingSquash(false);
+
         (*squashIt[tid])->setCanCommit();
 
 
@@ -398,6 +431,111 @@ ROB<Impl>::doSquash(ThreadID tid)
 
     if (robTailUpdate) {
         updateTail();
+    }
+}
+
+
+/* **************************
+ * [SafeSpec] update load insts state
+ * isPrevInstsCompleted; isPrevBrsResolved
+ * *************************/
+template <class Impl>
+void
+ROB<Impl>::updateVisibleState()
+{
+    list<ThreadID>::iterator threads = activeThreads->begin();
+    list<ThreadID>::iterator end = activeThreads->end();
+
+    while (threads != end) {
+        ThreadID tid = *threads++;
+
+        if (instList[tid].empty())
+            continue;
+
+        InstIt inst_it = instList[tid].begin();
+        InstIt tail_inst_it = instList[tid].end();
+
+        bool prevInstsComplete=true;
+        bool prevBrsResolved=true;
+        bool prevInstsCommitted=true;
+        bool prevBrsCommitted=true;
+
+        while (inst_it != tail_inst_it) {
+            DynInstPtr inst = *inst_it++;
+
+            assert(inst!=0);
+
+            if (!prevInstsComplete &&
+                    !prevBrsResolved) {
+                break;
+            }
+
+            //if (inst->isLoad()) {
+                if (prevInstsComplete) {
+                    inst->setPrevInstsCompleted();
+                }
+                if (prevBrsResolved){
+                    inst->setPrevBrsResolved();
+                }
+                if (prevInstsCommitted) {
+                    inst->setPrevInstsCommitted();
+                }
+                if (prevBrsCommitted) {
+                    inst->setPrevBrsCommitted();
+                }
+            //}
+
+            // Update prev control insts state
+            if (inst->isControl()){
+                prevBrsCommitted = false;
+                if (!inst->readyToCommit() || inst->getFault()!=NoFault
+                        || inst->isSquashed()){
+                    prevBrsResolved = false;
+                }
+            }
+
+            prevInstsCommitted = false;
+
+            // Update prev insts state
+            if (inst->isNonSpeculative() || inst->isStoreConditional()
+               || inst->isMemBarrier() || inst->isWriteBarrier() ||
+               (inst->isLoad() && inst->strictlyOrdered())){
+                //Some special instructions, directly set canCommit
+                //when entering ROB
+                prevInstsComplete = false;
+            }
+            if ( !(inst->readyToCommit() & inst->isLoadSafeToCommit())
+                    || inst->getFault()!=NoFault
+                    || inst->isSquashed()){
+                prevInstsComplete = false;
+            }
+
+            /*** [Jiyong, STT] add logic for updating flags when apply STT ***/
+            if (cpu->protectionEnabled && !cpu->isInvisibleSpec){
+                // fence
+                //if ((cpu->isFuturistic && inst->isPrevInstsCommitted()) ||
+                    //(!cpu->isFuturistic && inst->isPrevBrsCommitted())){
+                if ((cpu->isFuturistic && inst->isPrevInstsCompleted()) ||
+                    (!cpu->isFuturistic && inst->isPrevBrsResolved())){
+                    inst->isUnsquashable(true);
+                } else {
+                    inst->isUnsquashable(false);
+                }
+            }
+            else if (cpu->protectionEnabled && cpu->isInvisibleSpec) {
+                // invisiSpec
+                if ((cpu->isFuturistic && inst->isPrevInstsCompleted()) ||
+                    (!cpu->isFuturistic && inst->isPrevBrsResolved())) {
+                    inst->isUnsquashable(true);
+                } else {
+                    inst->isUnsquashable(false);
+                }
+            }
+            else {
+                // unsafebaseline
+                inst->isUnsquashable(true);
+            }
+        }
     }
 }
 
@@ -558,6 +696,205 @@ ROB<Impl>::findInst(ThreadID tid, InstSeqNum squash_inst)
     for (InstIt it = instList[tid].begin(); it != instList[tid].end(); it++) {
         if ((*it)->seqNum == squash_inst) {
             return *it;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * [Jiyong, STT] routines for STT
+ */
+template <class Impl>
+void
+ROB<Impl>::explicit_flow(ThreadID tid, InstIt instIt)
+{
+    DynInstPtr inst = (*instIt);
+    for (int i = 0; i < inst->numSrcRegs(); i++){
+        if (inst->getArgProducer(i) != DynInstPtr()){
+            DynInstPtr argProducer = inst->getArgProducer(i);
+            assert(argProducer->threadNumber == tid);
+            if (argProducer->isDestTainted()
+                && !argProducer->isCommitted()) {
+                inst->hasExplicitFlow(true);
+                return;
+            }
+        }
+    }
+    inst->hasExplicitFlow(false);
+    return;
+}
+
+template <class Impl>
+void
+ROB<Impl>::address_flow(ThreadID tid, InstIt instIt)
+{
+    DynInstPtr inst = (*instIt);
+    if (inst->isMemRef()) {
+        if (inst->isStore()) {
+            for (int i = 1; i < inst->numSrcRegs(); i++){
+                if (inst->getArgProducer(i) != DynInstPtr()){
+                    DynInstPtr argProducer = inst->getArgProducer(i);
+                    assert(argProducer->threadNumber == tid);
+                    if (argProducer->isDestTainted()
+                        && !argProducer->isCommitted()) {
+                        inst->isAddrTainted(true);
+                        return;
+                    }
+                }
+            }
+        }
+        else if (inst->isLoad()) {
+            for (int i = 0; i < inst->numSrcRegs(); i++){
+                if (inst->getArgProducer(i) != DynInstPtr()){
+                    DynInstPtr argProducer = inst->getArgProducer(i);
+                    assert(argProducer->threadNumber == tid);
+                    if (argProducer->isDestTainted()
+                        && !argProducer->isCommitted()) {
+                        inst->isAddrTainted(true);
+                        return;
+                    }
+                }
+            }
+        }
+        else {
+            printf("Unidentified instruction.\n");
+            print_robs();
+            assert (0);
+        }
+
+        inst->isAddrTainted(false);
+    } else {
+        inst->isAddrTainted(false);
+    }
+}
+
+template <class Impl>
+void
+ROB<Impl>::implicit_flow(ThreadID tid, InstIt instIt)
+{
+    DynInstPtr inst = (*instIt);
+    if (cpu->impChannel) {
+        for (auto prevInstIt = instList[tid].begin(); prevInstIt != instIt; prevInstIt++) {
+            DynInstPtr prevInst = (*prevInstIt);
+            if (prevInst->isControl() && prevInst->hasExplicitFlow()) {
+                inst->hasImplicitFlow(true);
+                return;
+            }
+        }
+    }
+    inst->hasImplicitFlow(false);
+    return;
+}
+
+template <class Impl>
+void
+ROB<Impl>::compute_taint()
+{
+    assert (cpu->STT);
+
+    list<ThreadID>::iterator threads = activeThreads->begin();
+    list<ThreadID>::iterator end = activeThreads->end();
+
+    while(threads != end) {
+        ThreadID tid = *threads++;
+        if (instList[tid].empty())
+            continue;
+
+        for (auto instIt = instList[tid].begin(); instIt != instList[tid].end(); instIt++) {
+            explicit_flow(tid, instIt);
+            implicit_flow(tid, instIt);
+            address_flow(tid, instIt);
+            DynInstPtr inst = (*instIt);
+
+            inst->isArgsTainted(inst->hasExplicitFlow());
+
+            inst->isDestTainted(inst->isArgsTainted());
+            if (inst->isAccess() && !inst->isUnsquashable()) {
+                inst->isDestTainted(true);
+            }
+        }
+    }
+}
+
+template <class Impl>
+void
+ROB<Impl>::print_robs()
+{
+    list<ThreadID>::iterator threads = activeThreads->begin();
+    list<ThreadID>::iterator end = activeThreads->end();
+
+    while(threads != end) {
+        ThreadID tid = *threads++;
+        printf("\nROB for thread %d\n", tid);
+
+        for(int i = 0; i < 50; i++)
+            printf("-");
+        printf("\n");
+
+        for (auto instIt = instList[tid].begin(); instIt != instList[tid].end(); instIt++) {
+            auto inst = (*instIt);
+            printf("ptr=%p, [sn:%ld], inst=%s ", inst.get(), inst->seqNum,
+                    inst->staticInst->getName().c_str());
+            for (int j = 0; j < inst->numDestRegs(); j++)
+                printf("%d(%s), ", inst->destRegIdx(j).index(), inst->destRegIdx(j).className());
+            printf("| ");
+            for (int j = 0; j < inst->numSrcRegs(); j++)
+                printf("%d(%s), ", inst->srcRegIdx(j).index(), inst->srcRegIdx(j).className());
+            printf("| ");
+
+            for (int j = 0; j < inst->numDestRegs(); j++)
+                printf("destPhys[%d] = %d(%d), ", j, inst->renamedDestRegIdx(j)->index(), inst->renamedDestRegIdx(j)->flatIndex());
+            for (int j = 0; j < inst->numSrcRegs(); j++)
+                printf("srcPhys[%d] = %d(%d), ", j, inst->renamedSrcRegIdx(j)->index(), inst->renamedSrcRegIdx(j)->flatIndex());
+            printf("fenceDelay=%d, ", inst->fenceDelay());
+            printf("squash=%d, fault?=%d, ", inst->isSquashed(), inst->getFault() != NoFault);
+            printf("pendingSquash?=%d, ", inst->hasPendingSquash());
+            printf("cancommit=%d, ", inst->checkCanCommit());
+            printf("status=");
+            if (inst->isCommitted())
+                printf("Committed, ");
+            else if (inst->readyToCommit()){
+                if (inst->isExecuted())
+                    printf("CanCommit(Exec), ");
+                else
+                    printf("CanCommit(NonExec), ");
+            }
+            else if (inst->isExecuted())
+                printf("Executed, ");
+            else if (inst->isIssued())
+                printf("Issued, ");
+            else
+                printf("Not Issued, ");
+            printf("unsquashable=%d, DestTainted=%d, ArgsTainted=%d, ", inst->isUnsquashable(), inst->isDestTainted(), inst->isArgsTainted());
+            printf("PBR=%d, PBC=%d, PIR=%d, PIC=%d, ", inst->isPrevBrsResolved(), inst->isPrevBrsCommitted(), inst->isPrevInstsCompleted(), inst->isPrevInstsCommitted());
+            for(int j = 0; j < inst->numSrcRegs(); j++){
+                printf("Producer[%d] = %p ", j, inst->getArgProducer(j).get());
+                if (inst->getArgProducer(j) != DynInstPtr())
+                    printf("[sn:%ld], ", inst->getArgProducer(j)->seqNum);
+            }
+            if (inst->numDestRegs() > 1){
+                printf("%d, %d, %d, %d, %d", inst->numFPDestRegs(), inst->numIntDestRegs(), inst->numCCDestRegs(), inst->numVecDestRegs(), inst->numVecElemDestRegs());
+            }
+            printf("\n");
+            for(int i = 0; i < 50; i++)
+                printf("-");
+            printf("\n");
+        }
+    }
+}
+
+
+template <class Impl>
+typename Impl::DynInstPtr
+ROB<Impl>::getResolvedPendingSquashInst(ThreadID tid)
+{
+    for (auto instIt = instList[tid].begin(); instIt != instList[tid].end(); instIt++) {
+        auto inst = (*instIt);
+        if (inst->hasPendingSquash()
+            && !inst->isArgsTainted()
+            && !inst->isSquashed()  // if it's already squashed, we ignore it
+            ) {
+            return inst;
         }
     }
     return NULL;

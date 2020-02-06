@@ -143,7 +143,9 @@ DefaultCommit<Impl>::DefaultCommit(O3CPU *_cpu, DerivO3CPUParams *params)
         lastCommitedSeqNum[tid] = 0;
         squashAfterInst[tid] = NULL;
     }
+    lastCommitTick = curTick();
     interrupt = NoFault;
+    stalled_counter = 0;
 }
 
 template <class Impl>
@@ -182,6 +184,41 @@ DefaultCommit<Impl>::regStats()
         .name(name() + ".branchMispredicts")
         .desc("The number of times a branch was mispredicted")
         .prereq(branchMispredicts);
+
+    // [Jiyong,STT] stats for STT
+    memoryViolations
+        .name(name() + ".memoryViolations")
+        .desc("The number of times a memory operation(load) has violation");
+
+    stalledBranchMispredicts
+        .name(name() + ".stalledBranchMispredicts")
+        .desc("The number of times a branch misprediction is stalled(STT)");
+
+    stalledMemoryViolations
+        .name(name() + ".stalledMemoryViolations")
+        .desc("The number of times a memory violation is stalled(STT)");
+
+    // [SafeSpec] stat for squash due to invalidation, failed validation
+    loadHitInvalidations
+        .name(name() + ".loadHitInvalidations")
+        .desc("The number of times a load hits a invalidation");
+        //.prereq(loadHitInvalidations);
+
+    loadHitExternalEvictions
+        .name(name() + ".loadHitExternalEvictions")
+        .desc("The number of times a load hits an external invalidation");
+        //.prereq(loadHitInvalidations);
+
+    loadValidationFails
+        .name(name() + ".loadValidationFails")
+        .desc("The number of times a load fails validation");
+        //.prereq(loadValidationFails);
+
+    validationStalls
+        .name(name() + ".validationStalls")
+        .desc("The number of ticks the commit is stalled due to waiting "
+                "for validation responses");
+        //.prereq(loadValidationFails);
 
     numCommittedDist
         .init(0,commitWidth,1)
@@ -579,6 +616,9 @@ DefaultCommit<Impl>::squashAll(ThreadID tid)
     toIEW->commitInfo[tid].squashInst = NULL;
 
     toIEW->commitInfo[tid].pc = pc[tid];
+
+    //TODO: send a packet to SpecBuffer to indicate flush
+    //
 }
 
 template <class Impl>
@@ -650,6 +690,7 @@ template <class Impl>
 void
 DefaultCommit<Impl>::tick()
 {
+    DPRINTF(Commit, "DefaultCommimt<Impl>::tick() begins\n");
     wroteToTimeBuffer = false;
     _nextStatus = Inactive;
 
@@ -705,13 +746,21 @@ DefaultCommit<Impl>::tick()
         } else if (!rob->isEmpty(tid)) {
             DynInstPtr inst = rob->readHeadInst(tid);
 
+            if (inst->isExecuted() && inst->needPostFetch()
+                    && !inst->isExposeCompleted()){
+                //stall due to waiting for validation response
+                if (curTick()-lastCommitTick > 0){
+                    validationStalls+= curTick()-lastCommitTick;
+                }
+
+            }
             ppCommitStall->notify(inst);
 
             DPRINTF(Commit,"[tid:%i]: Can't commit, Instruction [sn:%lli] PC "
                     "%s is head of ROB and not ready\n",
                     tid, inst->seqNum, inst->pcState());
         }
-
+        lastCommitTick = curTick();
         DPRINTF(Commit, "[tid:%i]: ROB has %d insts & %d free entries.\n",
                 tid, rob->countInsts(tid), rob->numFreeEntries(tid));
     }
@@ -832,6 +881,7 @@ DefaultCommit<Impl>::commit()
             squashFromTrap(tid);
         } else if (tcSquash[tid]) {
             assert(commitStatus[tid] != TrapPending);
+            //TC: thread context. [mengjia]
             squashFromTC(tid);
         } else if (commitStatus[tid] == SquashAfterPending) {
             // A squash from the previous cycle of the commit stage (i.e.,
@@ -843,65 +893,82 @@ DefaultCommit<Impl>::commit()
         // Squashed sequence number must be older than youngest valid
         // instruction in the ROB. This prevents squashes from younger
         // instructions overriding squashes from older instructions.
-        if (fromIEW->squash[tid] &&
-            commitStatus[tid] != TrapPending &&
-            fromIEW->squashedSeqNum[tid] <= youngestSeqNum[tid]) {
+        /****** [Jiyong,STT] Change squash logic ******/
+        if (!cpu->STT){   // we don't apply STT
+            // normal squash handling
+            if (fromIEW->squash[tid] &&
+                commitStatus[tid] != TrapPending &&
+                fromIEW->squashedSeqNum[tid] <= youngestSeqNum[tid]) {
 
-            if (fromIEW->mispredictInst[tid]) {
-                DPRINTF(Commit,
-                    "[tid:%i]: Squashing due to branch mispred PC:%#x [sn:%i]\n",
-                    tid,
-                    fromIEW->mispredictInst[tid]->instAddr(),
-                    fromIEW->squashedSeqNum[tid]);
-            } else {
-                DPRINTF(Commit,
-                    "[tid:%i]: Squashing due to order violation [sn:%i]\n",
-                    tid, fromIEW->squashedSeqNum[tid]);
+                // we squash with signal from fromIEW
+                handleSquashSignalFromIEW(tid);
             }
+        } else {    // we apply STT
+            if (fromIEW->squash[tid] &&
+                commitStatus[tid] != TrapPending &&
+                fromIEW->squashedSeqNum[tid] <= youngestSeqNum[tid]) {  // there is a incoming squash signal
 
-            DPRINTF(Commit, "[tid:%i]: Redirecting to PC %#x\n",
-                    tid,
-                    fromIEW->pc[tid].nextInstAddr());
-
-            commitStatus[tid] = ROBSquashing;
-
-            // If we want to include the squashing instruction in the squash,
-            // then use one older sequence number.
-            InstSeqNum squashed_inst = fromIEW->squashedSeqNum[tid];
-
-            if (fromIEW->includeSquashInst[tid]) {
-                squashed_inst--;
-            }
-
-            // All younger instructions will be squashed. Set the sequence
-            // number as the youngest instruction in the ROB.
-            youngestSeqNum[tid] = squashed_inst;
-
-            rob->squash(squashed_inst, tid);
-            changedROBNumEntries[tid] = true;
-
-            toIEW->commitInfo[tid].doneSeqNum = squashed_inst;
-
-            toIEW->commitInfo[tid].squash = true;
-
-            // Send back the rob squashing signal so other stages know that
-            // the ROB is in the process of squashing.
-            toIEW->commitInfo[tid].robSquashing = true;
-
-            toIEW->commitInfo[tid].mispredictInst =
-                fromIEW->mispredictInst[tid];
-            toIEW->commitInfo[tid].branchTaken =
-                fromIEW->branchTaken[tid];
-            toIEW->commitInfo[tid].squashInst =
-                                    rob->findInst(tid, squashed_inst);
-            if (toIEW->commitInfo[tid].mispredictInst) {
-                if (toIEW->commitInfo[tid].mispredictInst->isUncondCtrl()) {
-                     toIEW->commitInfo[tid].branchTaken = true;
+                if (!cpu->impChannel) { // Ignore implicit channel
+                    handleSquashSignalFromIEW(tid);
                 }
-                ++branchMispredicts;
+                // Ignore
+                //else if (cpu->configImpFlow == 1) {  // Eager scheme
+                    //if (fromIEW->mispredictInst[tid]) { // a branch
+                        //// for branch squash, we can handle now, since we are tracking implicit flow
+                        //handleSquashSignalFromIEW(tid);
+                    //} else {  // a load
+                        //// we must delay the load squash if argsTainted
+                        //if (fromIEW->instCausingSquash[tid]->isArgsTainted()){
+                            //DPRINTF(Commit, "[tid:%i]: (Eager) A load mispredictInst [sn:%lli,0x%lx] PC %s is made pending.\n",
+                                    //tid,
+                                    //fromIEW->instCausingSquash[tid]->seqNum,
+                                    //fromIEW->instCausingSquash[tid]->seqNum,
+                                    //fromIEW->instCausingSquash[tid]->pcState());
+                            //fromIEW->instCausingSquash[tid]->hasPendingSquash(true);
+                            //++stalledMemoryViolations;
+                        //} else {
+                            //handleSquashSignalFromIEW(tid);
+                        //}
+                    //}
+                //}
+                else if (cpu->impChannel){  // Consider implicit channel
+                    // we must delay both branch and load squash if argsTainted
+                    if (fromIEW->instCausingSquash[tid]->isArgsTainted()){
+                        if (fromIEW->mispredictInst[tid]) {
+                            DPRINTF(Commit, "[tid:%i]: (Lazy) A branch mispredicInst [sn:%lli,0x%lx] PC %s is made pending.\n",
+                                    tid,
+                                    fromIEW->instCausingSquash[tid]->seqNum,
+                                    fromIEW->instCausingSquash[tid]->seqNum,
+                                    fromIEW->instCausingSquash[tid]->pcState());
+                            ++stalledBranchMispredicts;
+                        } else {
+                            DPRINTF(Commit, "[tid:%i]: (Lazy) A load mispredictInst [sn:%lli,0x%lx] PC %s is made pending.\n", 
+                                    tid,
+                                    fromIEW->instCausingSquash[tid]->seqNum,
+                                    fromIEW->instCausingSquash[tid]->seqNum,
+                                    fromIEW->instCausingSquash[tid]->pcState());
+                            ++stalledMemoryViolations;
+                        }
+                        fromIEW->instCausingSquash[tid]->hasPendingSquash(true);
+                    } else {
+                        handleSquashSignalFromIEW(tid);
+                    }
+                }
+                else {
+                    // unknown scheme
+                    printf("ERROR: Unspecified implicit flow handling\n");
+                    assert(0);
+                }
             }
-
-            toIEW->commitInfo[tid].pc = fromIEW->pc[tid];
+            else {  // there is no squash signal comming
+                DynInstPtr resolvedPendingSquashInst = rob->getResolvedPendingSquashInst(tid);
+                if (resolvedPendingSquashInst &&
+                    commitStatus[tid] != TrapPending &&
+                    resolvedPendingSquashInst->seqNum <= youngestSeqNum[tid]){
+                    resolvedPendingSquashInst->hasPendingSquash(false);
+                    handleSquashSignalFromROB(tid, resolvedPendingSquashInst);
+                }
+            }
         }
 
         if (commitStatus[tid] == ROBSquashing) {
@@ -955,8 +1022,146 @@ DefaultCommit<Impl>::commit()
             toIEW->commitInfo[tid].freeROBEntries = rob->numFreeEntries(tid);
             wroteToTimeBuffer = true;
         }
-
     }
+}
+
+/*** [Jiyong, STT] ***/
+template <class Impl>
+void
+DefaultCommit<Impl>::handleSquashSignalFromIEW(ThreadID tid)
+{
+
+    if (fromIEW->mispredictInst[tid]) {
+        DPRINTF(Commit, "[tid:%i]: A incoming squash [sn:%lli,0x%lx] PC %s can be resolved now\n",
+                tid,
+                fromIEW->mispredictInst[tid]->seqNum,
+                fromIEW->mispredictInst[tid]->seqNum,
+                fromIEW->mispredictInst[tid]->pcState());
+        DPRINTF(Commit,
+            "[tid:%i]: Squashing due to branch mispred PC:%#x [sn:%i]\n",
+            tid,
+            fromIEW->mispredictInst[tid]->instAddr(),
+            fromIEW->squashedSeqNum[tid]);
+    } else {
+        DPRINTF(Commit,
+            "[tid:%i]: Squashing due to order violation [sn:%i]\n",
+            tid, fromIEW->squashedSeqNum[tid]);
+    }
+
+    DPRINTF(Commit, "[tid:%i]: Redirecting to PC %#x\n",
+            tid,
+            fromIEW->pc[tid].nextInstAddr());
+
+    commitStatus[tid] = ROBSquashing;
+
+    // If we want to include the squashing instruction in the squash,
+    // then use one older sequence number.
+    InstSeqNum squashed_inst = fromIEW->squashedSeqNum[tid];
+
+    if (fromIEW->includeSquashInst[tid]) {
+        squashed_inst--;
+    }
+
+    // All younger instructions will be squashed. Set the sequence
+    // number as the youngest instruction in the ROB.
+    youngestSeqNum[tid] = squashed_inst;
+
+    rob->squash(squashed_inst, tid);
+    changedROBNumEntries[tid] = true;
+
+    toIEW->commitInfo[tid].doneSeqNum = squashed_inst;
+
+    toIEW->commitInfo[tid].squash = true;
+
+    // Send back the rob squashing signal so other stages know that
+    // the ROB is in the process of squashing.
+    toIEW->commitInfo[tid].robSquashing = true;
+
+    toIEW->commitInfo[tid].mispredictInst = fromIEW->mispredictInst[tid];
+    toIEW->commitInfo[tid].branchTaken = fromIEW->branchTaken[tid];
+    toIEW->commitInfo[tid].squashInst = rob->findInst(tid, squashed_inst);
+
+    if (toIEW->commitInfo[tid].mispredictInst) {
+        if (toIEW->commitInfo[tid].mispredictInst->isUncondCtrl()) {
+             toIEW->commitInfo[tid].branchTaken = true;
+        }
+        ++branchMispredicts;
+    } else {
+        ++memoryViolations;
+    }
+
+    toIEW->commitInfo[tid].pc = fromIEW->pc[tid];
+}
+
+template <class Impl>
+void
+DefaultCommit<Impl>::handleSquashSignalFromROB(ThreadID tid, DynInstPtr &pendingMispInst)
+{
+    // only STT has this mode
+    assert(cpu->STT);
+
+    DPRINTF(Commit, "[tid:%i]: (Lazy enabled) A pending squash [sn:%lli,0x%lx] PC %s can be resolved now\n",
+            tid,
+            pendingMispInst->seqNum,
+            pendingMispInst->seqNum,
+            pendingMispInst->pcState());
+
+    TheISA::PCState nextPC = pendingMispInst->pcState();
+
+    if (pendingMispInst->isControl()) {
+        DPRINTF(Commit,
+            "[tid:%i]: (Lazy) Squashing due to branch mispred PC:%#x [sn:%i]\n",
+            tid,
+            pendingMispInst->instAddr(),
+            pendingMispInst->seqNum);
+        TheISA::advancePC(nextPC, pendingMispInst->staticInst);
+    } else if (pendingMispInst->isLoad()){
+        DPRINTF(Commit,
+            "[tid:%i]: (Lazy) Squashing due to order violation [sn:%i]\n",
+            tid, pendingMispInst->seqNum);
+    } else {
+        assert(0);
+    }
+
+
+    DPRINTF(Commit, "[tid:%i]: (Lazy) Redirecting to PC %#x\n",
+            tid,
+            nextPC.nextInstAddr());
+
+    commitStatus[tid] = ROBSquashing;
+
+    InstSeqNum squashed_inst = pendingMispInst->seqNum;
+
+    if (pendingMispInst->isLoad())
+        squashed_inst--;
+
+    youngestSeqNum[tid] = squashed_inst;
+
+    rob->squash(squashed_inst, tid);
+    changedROBNumEntries[tid] = true;
+
+    toIEW->commitInfo[tid].doneSeqNum = squashed_inst;
+    toIEW->commitInfo[tid].squash = true;
+    toIEW->commitInfo[tid].robSquashing = true;
+
+    if (pendingMispInst->isControl()){
+        toIEW->commitInfo[tid].mispredictInst = pendingMispInst;
+        toIEW->commitInfo[tid].branchTaken = pendingMispInst->pcState().branching();
+    } else
+        toIEW->commitInfo[tid].mispredictInst = NULL;
+
+    toIEW->commitInfo[tid].squashInst = rob->findInst(tid, squashed_inst);
+
+    if (toIEW->commitInfo[tid].mispredictInst) {
+        if (toIEW->commitInfo[tid].mispredictInst->isUncondCtrl()) {
+            toIEW->commitInfo[tid].branchTaken = true;
+        }
+        ++branchMispredicts;
+    } else {
+        ++memoryViolations;
+    }
+
+    toIEW->commitInfo[tid].pc = nextPC;
 }
 
 template <class Impl>
@@ -1028,6 +1233,18 @@ DefaultCommit<Impl>::commitInsts()
             // Try to commit the head instruction.
             bool commit_success = commitHead(head_inst, num_committed);
 
+            /*** [Jiyong, STT] sanity check ***/
+            if (commit_success)
+                stalled_counter = 0;
+            else
+                stalled_counter++;
+
+            if (stalled_counter == 100000) {
+                rob->print_robs();
+                assert (0);
+            }
+
+
             if (commit_success) {
                 ++num_committed;
                 statCommittedInstType[tid][head_inst->opClass()]++;
@@ -1039,6 +1256,7 @@ DefaultCommit<Impl>::commitInsts()
                 toIEW->commitInfo[tid].doneSeqNum = head_inst->seqNum;
 
                 if (tid == 0) {
+                    //maybe we can use this to mask interrupts [mengjia]
                     canHandleInterrupts =  (!head_inst->isDelayedCommit()) &&
                                            ((THE_ISA != ALPHA_ISA) ||
                                              (!(pc[0].instAddr() & 0x3)));
@@ -1117,7 +1335,7 @@ DefaultCommit<Impl>::commitInsts()
                 if (!interrupt && avoidQuiesceLiveLock &&
                     onInstBoundary && cpu->checkInterrupts(cpu->tcBase(0)))
                     squashAfter(tid, head_inst);
-            } else {
+            } else { // !commit_success
                 DPRINTF(Commit, "Unable to commit head instruction PC:%s "
                         "[tid:%i] [sn:%i].\n",
                         head_inst->pcState(), tid ,head_inst->seqNum);
@@ -1219,6 +1437,8 @@ DefaultCommit<Impl>::commitHead(DynInstPtr &head_inst, unsigned inst_num)
         // execution doesn't generate extra squashes.
         thread[tid]->noSquashFromTC = true;
 
+        // [SafeSpec] update squash stat for invalidation or validation fails
+        updateSquashStats(head_inst);
         // Execute the trap.  Although it's slightly unrealistic in
         // terms of timing (as it doesn't wait for the full timing of
         // the trap event to complete before updating state), it's
@@ -1272,6 +1492,7 @@ DefaultCommit<Impl>::commitHead(DynInstPtr &head_inst, unsigned inst_num)
     }
     DPRINTF(Commit, "Committing instruction with [sn:%lli] PC %s\n",
             head_inst->seqNum, head_inst->pcState());
+
     if (head_inst->traceData) {
         head_inst->traceData->setFetchSeq(head_inst->seqNum);
         head_inst->traceData->setCPSeq(thread[tid]->numOp);
@@ -1350,6 +1571,7 @@ DefaultCommit<Impl>::markCompletedInsts()
     // Grab completed insts out of the IEW instruction queue, and mark
     // instructions completed within the ROB.
     for (int inst_num = 0; inst_num < fromIEW->size; ++inst_num) {
+        DPRINTF(Commit, "get the inst [num:%d]\n", inst_num);
         assert(fromIEW->insts[inst_num]);
         if (!fromIEW->insts[inst_num]->isSquashed()) {
             DPRINTF(Commit, "[tid:%i]: Marking PC %s, [sn:%lli] ready "
@@ -1361,6 +1583,31 @@ DefaultCommit<Impl>::markCompletedInsts()
             // Mark the instruction as ready to commit.
             fromIEW->insts[inst_num]->setCanCommit();
         }
+    }
+
+    // [SafeSpec]
+    // update load status
+    // isPrevInstsCompleted; isPrevBrsResolved
+    rob->updateVisibleState();
+
+    // [Jiyong, STT]
+    // taint/untaint rob instructions
+    rob->compute_taint();
+}
+
+// [SafeSpec] update squash stat for loads
+template <class Impl>
+void
+DefaultCommit<Impl>::updateSquashStats(DynInstPtr &inst)
+{
+    if (inst->hitInvalidation()){
+        loadHitInvalidations++;
+    }
+    if (inst->validationFail()){
+        loadValidationFails++;
+    }
+    if (inst->hitExternalEviction()){
+        loadHitExternalEvictions++;
     }
 }
 

@@ -102,13 +102,14 @@ class BaseDynInst : public ExecContext, public RefCounted
         RobEntry,                /// Instruction is in the ROB
         LsqEntry,                /// Instruction is in the LSQ
         Completed,               /// Instruction has completed
-        ResultReady,             /// Instruction has its result
+        ResultReady,             /// Instruction has its result // never used
         CanIssue,                /// Instruction can issue and execute
         Issued,                  /// Instruction has issued
         Executed,                /// Instruction has executed
         CanCommit,               /// Instruction can commit
         AtCommit,                /// Instruction has reached commit
         Committed,               /// Instruction has committed
+        Removed,                 /// Instruction has been removed from pipeline
         Squashed,                /// Instruction is squashed
         SquashedInIQ,            /// Instruction is squashed in the IQ
         SquashedInLSQ,           /// Instruction is squashed in the LSQ
@@ -120,6 +121,31 @@ class BaseDynInst : public ExecContext, public RefCounted
                                  /// instructions ahead of it
         SerializeAfter,          /// Needs to serialize instructions behind it
         SerializeHandled,        /// Serialization has been handled
+
+        // [jiyong] a spec GETS is completed
+        SpecCompleted,
+        // [mengjia] indicates whether received specReadResp
+        //ValidationCompleted, // never used
+        // indicates whether validation finishes
+        ExposeCompleted,
+        ExposeSent,
+        // indicates whether expose finishes
+        // (should set when expose is sent out)
+        PrevInstsCompleted, // all prev instrs are completed
+        // indicate whether previous instructions completed
+        PrevBrsResolved, // all prev branches are completed
+        // [mengjia] indicate whether previous branches are resolved
+        PrevInstsCommitted,
+        // indicate whether previous instructions committed
+        PrevBrsCommitted,
+        // [mengjia] indicate whether previous branches are committed
+        L1HitHigh,
+        L1HitLow,
+        SpecBuffObsoleteHigh,
+        SpecBuffObsoleteLow,
+        // [SafeSpec] it hits in L1 and is open to invalidations
+        /*** [Jiyong,STT] ***/
+        InStallList,    // instruction is ready to issue(regsReady) but argsTainted
         NumStatus
     };
 
@@ -136,6 +162,30 @@ class BaseDynInst : public ExecContext, public RefCounted
         IsStrictlyOrdered,
         ReqMade,
         MemOpDone,
+        // [mengjia] indicates need validation or expose
+        NeedPostFetch,      // validate/expose(true), nothing(false)
+        NeedDeletePostReq,  // don't care
+        // [mengjia] indicates only need to expose, do not need to validate
+        NeedExposeOnly,     // set at visibility point: validate(true), expose(false)
+        // [SafeSpec] indicate the instruction needs to be delayed
+        // due to virtual fences before to defend against speculative attacks
+        FenceDelay,
+        // [SafeSpec] indicate the load is legal to be visible
+        ReadyToExpose,      // FenceDelay AND arguments are ready
+        HitInvalidation,
+        HitExternalEviction,
+        ValidationFail,     // these 3 flags are used for collecting stats
+        OnlyWaitForFence,
+        OnlyWaitForExpose,  // only used in invsiSpec mode
+        SpecTLBMiss,
+        // [Jiyong,STT] The following are STT flags
+        IsUnsquashable,     // a instr is not squashable. In InvisiSpec it's equal to readyToExpose. In STT it's not since access instr is always readyToExpose and readyToExpose == !isArgsTainted
+        IsDestTainted,
+        IsArgsTainted,
+        IsAddrTainted,
+        HasExplicitFlow,
+        HasImplicitFlow,
+        HasPendingSquash,   // for branch/load, if a squash is postponed due to the tainted dependent operands
         MaxFlags
     };
 
@@ -222,11 +272,23 @@ class BaseDynInst : public ExecContext, public RefCounted
     /** Pointer to the data for the memory access. */
     uint8_t *memData;
 
+    /** Pointer to the data for the validation result. */
+    uint8_t *vldData;
+
     /** Load queue index. */
     int16_t lqIdx;
 
     /** Store queue index. */
     int16_t sqIdx;
+
+    /*** [Jiyong,STT] ***/
+    /** Pointer to the data forwarded from store **/
+    uint8_t *stFwdData;
+    int      stFwdDataSize;
+
+    /** If load-store forwarding happens but need extra dummy load **/
+    bool alreadyForwarded;
+
 
 
     /////////////////////// TLB Miss //////////////////////
@@ -238,6 +300,12 @@ class BaseDynInst : public ExecContext, public RefCounted
     RequestPtr savedSreqLow;
     RequestPtr savedSreqHigh;
 
+    /** [SafeSpec]
+     * Saved memory requests (needed for post-fetch validation/expose).
+     */
+    RequestPtr postReq;
+    RequestPtr postSreqLow;
+    RequestPtr postSreqHigh;
     /////////////////////// Checker //////////////////////
     // Need a copy of main request pointer to verify on writes.
     RequestPtr reqToVerify;
@@ -263,6 +331,9 @@ class BaseDynInst : public ExecContext, public RefCounted
      */
     std::array<PhysRegIdPtr, TheISA::MaxInstDestRegs> _prevDestRegIdx;
 
+    /*** [Jiyong,STT] the producer of arguments(-1 for none) ***/
+    std::array<DynInstPtr, TheISA::MaxInstSrcRegs> argProducers;
+
 
   public:
     /** Records changes to result? */
@@ -275,8 +346,69 @@ class BaseDynInst : public ExecContext, public RefCounted
     bool memOpDone() const { return instFlags[MemOpDone]; }
     void memOpDone(bool f) { instFlags[MemOpDone] = f; }
 
+    /** [mengjia] Whether or not need pseudo-validation.
+     * whether speculative laod finishes,
+     * whether validation completes or not (success) */
+    bool needExposeOnly() const { return instFlags[NeedExposeOnly]; }
+    void needExposeOnly(bool f) { instFlags[NeedExposeOnly] = f; }
+
+    bool needPostFetch() const { return instFlags[NeedPostFetch]; }
+    void needPostFetch(bool f) { instFlags[NeedPostFetch] = f; }
+
+    bool needDeletePostReq() const { return instFlags[NeedDeletePostReq]; }
+    void needDeletePostReq(bool f) { instFlags[NeedDeletePostReq] = f; }
+
+    bool fenceDelay() const { return instFlags[ReadyToExpose]; }
+    void fenceDelay(bool f) { instFlags[ReadyToExpose] = f; }
+
+    bool readyToExpose() const { return instFlags[FenceDelay]; }
+    void readyToExpose(bool f) { instFlags[FenceDelay] = f; }
+
+    bool hitInvalidation() const { return instFlags[HitInvalidation]; }
+    void hitInvalidation(bool f) { instFlags[HitInvalidation] = f; }
+
+    bool hitExternalEviction() const { return instFlags[HitExternalEviction]; }
+    void hitExternalEviction(bool f) { instFlags[HitExternalEviction] = f; }
+
+    bool validationFail() const { return instFlags[ValidationFail]; }
+    void validationFail(bool f) { instFlags[ValidationFail] = f; }
+
+    bool onlyWaitForFence() const { return instFlags[OnlyWaitForFence]; }
+    void onlyWaitForFence(bool f) { instFlags[OnlyWaitForFence] = f; }
+
+    bool onlyWaitForExpose() const { return instFlags[OnlyWaitForExpose]; }
+    void onlyWaitForExpose(bool f) { instFlags[OnlyWaitForExpose] = f; }
+
+    bool specTLBMiss() const { return instFlags[SpecTLBMiss]; }
+    void specTLBMiss(bool f) { instFlags[SpecTLBMiss] = f; }
+    /*[mengjia] added 2 new flags and corresponding functions*/
+
+    /*** [Jiyong,STT] STT Flags setter and accessor ***/
+    bool isUnsquashable() const { return instFlags[IsUnsquashable]; }
+    void isUnsquashable(bool f) { instFlags[IsUnsquashable] = f; }
+
+    bool isDestTainted() const { return instFlags[IsDestTainted]; }
+    void isDestTainted(bool f) { instFlags[IsDestTainted] = f; }
+
+    bool isArgsTainted() const { return instFlags[IsArgsTainted]; }
+    void isArgsTainted(bool f) { instFlags[IsArgsTainted] = f; }
+
+    bool isAddrTainted() const { return instFlags[IsAddrTainted]; }
+    void isAddrTainted(bool f) { instFlags[IsAddrTainted] = f; }
+
+    bool hasExplicitFlow() const { return instFlags[HasExplicitFlow]; }
+    void hasExplicitFlow(bool f) { instFlags[HasExplicitFlow] = f; }
+
+    bool hasImplicitFlow() const { return instFlags[HasImplicitFlow]; }
+    void hasImplicitFlow(bool f) { instFlags[HasImplicitFlow] = f; }
+
+    bool hasPendingSquash() const { return instFlags[HasPendingSquash]; }
+    void hasPendingSquash(bool f) { instFlags[HasPendingSquash] = f; }
+
     bool notAnInst() const { return instFlags[NotAnInst]; }
     void setNotAnInst() { instFlags[NotAnInst] = true; }
+
+
 
 
     ////////////////////////////////////////////
@@ -429,6 +561,22 @@ class BaseDynInst : public ExecContext, public RefCounted
     /** BaseDynInst destructor. */
     ~BaseDynInst();
 
+    /*** [Jiyong,STT] functions related to argProducer ***/
+    DynInstPtr getArgProducer(int idx)
+    {
+        return argProducers[idx];
+    }
+
+    static DynInstPtr null_inst_ptr;
+    void clearArgProducer(int idx){
+        argProducers[idx] = null_inst_ptr;
+    }
+
+    void setArgProducer(int idx, DynInstPtr &inst)
+    {
+        argProducers[idx] = inst;
+    }
+
   private:
     /** Function to initialize variables in the constructors. */
     void initVars();
@@ -522,6 +670,14 @@ class BaseDynInst : public ExecContext, public RefCounted
     bool isCondDelaySlot() const { return staticInst->isCondDelaySlot(); }
     bool isThreadSync()   const { return staticInst->isThreadSync(); }
     bool isSerializing()  const { return staticInst->isSerializing(); }
+
+    // [Jiyong,STT] The following are STT status
+    bool isAccess() const { return staticInst->isLoad(); }                /// Instruction is an access instruction(root of taint)
+    bool isTransmit() const { return staticInst->isLoad(); }              /// Instruction is a transmit instruction(has to be made invisible)
+
+    // add block attribute for synamic instruction type [mengjia]
+    bool isBlock()  const { return staticInst->isBlock(); }
+
     bool isSerializeBefore() const
     { return staticInst->isSerializeBefore() || status[SerializeBefore]; }
     bool isSerializeAfter() const
@@ -703,10 +859,65 @@ class BaseDynInst : public ExecContext, public RefCounted
     /** Returns whether or not this instruction is completed. */
     bool isCompleted() const { return status[Completed]; }
 
-    /** Marks the result as ready. */
+    /* [mengjia] new status for load operations */
+    //void setSpecSent() { status.set(SpecSent); }
+    //bool isSpecSent() const { return status[SpecSent]; }
+
+    void setSpecCompleted() { status.set(SpecCompleted); }
+    bool isSpecCompleted() const { return status[SpecCompleted]; }
+
+    //void setValidationCompleted() { status.set(ValidationCompleted); }
+    //bool isValidationCompleted() const { return status[ValidationCompleted]; }
+
+    void setExposeCompleted() { status.set(ExposeCompleted); }
+    bool isExposeCompleted() const { return status[ExposeCompleted]; }
+
+    // mengjia, for writeback invisispec loads
+    bool isLoadSafeToCommit() const {
+        if (isLoad() && !isSquashed() && getFault() == NoFault) {
+            if (needPostFetch() && needExposeOnly() && !isExposeSent())
+                return false;
+            if (needPostFetch() && !needExposeOnly() && !isExposeCompleted())
+                return false;
+            return true;
+        } else {
+            return true;
+        }
+    }
+
+    void setExposeSent() { status.set(ExposeSent); }
+    bool isExposeSent() const { return status[ExposeSent]; }
+
+    void setL1HitHigh() { status.set(L1HitHigh); }
+    void clearL1HitHigh() { status.reset(L1HitHigh); }
+    bool isL1HitHigh() const { return status[L1HitHigh]; }
+
+    void setL1HitLow() { status.set(L1HitLow); }
+    void clearL1HitLow() { status.reset(L1HitLow); }
+    bool isL1HitLow() const { return status[L1HitLow]; }
+
+    void setPrevInstsCompleted() { status.set(PrevInstsCompleted); }
+    bool isPrevInstsCompleted() const { return status[PrevInstsCompleted]; }
+
+    void setSpecBuffObsoleteHigh() { status.set(SpecBuffObsoleteHigh); }
+    bool isSpecBuffObsoleteHigh() const { return status[SpecBuffObsoleteHigh]; }
+
+    void setSpecBuffObsoleteLow() { status.set(SpecBuffObsoleteLow); }
+    bool isSpecBuffObsoleteLow() const { return status[SpecBuffObsoleteLow]; }
+
+    void setPrevBrsResolved() { status.set(PrevBrsResolved); }
+    bool isPrevBrsResolved() const { return status[PrevBrsResolved]; }
+
+    void setPrevInstsCommitted() { status.set(PrevInstsCommitted); }
+    bool isPrevInstsCommitted() const { return status[PrevInstsCommitted]; }
+
+    void setPrevBrsCommitted() { status.set(PrevBrsCommitted); }
+    bool isPrevBrsCommitted() const { return status[PrevBrsCommitted]; }
+
+    /** Marks the result as ready. */   // never used
     void setResultReady() { status.set(ResultReady); }
 
-    /** Returns whether or not the result is ready. */
+    /** Returns whether or not the result is ready. */  // never used
     bool isResultReady() const { return status[ResultReady]; }
 
     /** Sets this instruction as ready to issue. */
@@ -715,8 +926,17 @@ class BaseDynInst : public ExecContext, public RefCounted
     /** Returns whether or not this instruction is ready to issue. */
     bool readyToIssue() const { return status[CanIssue]; }
 
+    /*** [Jiyong,STT] for measuring more transmit instruction types ***/
+    bool readyToIssue_UT() const;
+
     /** Clears this instruction being able to issue. */
     void clearCanIssue() { status.reset(CanIssue); }
+
+    void addToStallList() { status.set(InStallList); }
+
+    void removeFromStallList() { status.reset(InStallList); }
+
+    bool isInStallList() const { return status[InStallList]; }
 
     /** Sets this instruction as issued from the IQ. */
     void setIssued() { status.set(Issued); }
@@ -740,7 +960,16 @@ class BaseDynInst : public ExecContext, public RefCounted
     void clearCanCommit() { status.reset(CanCommit); }
 
     /** Returns whether or not this instruction is ready to commit. */
-    bool readyToCommit() const { return status[CanCommit]; }
+    /***** [Jiyong,STT] add hasPendingSquash here ******/
+    bool readyToCommit() const {
+        return  status[CanCommit] &&
+                (!instFlags[HasPendingSquash] ||
+                 (instFlags[HasPendingSquash] && status[Squashed])
+                ); }
+    bool checkCanCommit() const { return status[CanCommit]; }
+
+    void setRemoved() { status.set(Removed); }
+    bool isRemoved() const { return status[Removed]; }
 
     void setAtCommit() { status.set(AtCommit); }
 
@@ -888,11 +1117,34 @@ class BaseDynInst : public ExecContext, public RefCounted
 };
 
 template<class Impl>
+typename Impl::DynInstPtr
+BaseDynInst<Impl>::null_inst_ptr = DynInstPtr();
+
+
+template<class Impl>
 Fault
 BaseDynInst<Impl>::initiateMemRead(Addr addr, unsigned size,
                                    Request::Flags flags)
 {
+    // [SafeSpec] do not start translation if
+    // there is a virtual fence ahead
+    assert(!fenceDelay());
+
+    if ( (flags.isSet(Request::ATOMIC_RETURN_OP)
+            || flags.isSet(Request::ATOMIC_NO_RETURN_OP)
+            || flags.isSet(Request::UNCACHEABLE)
+            || flags.isSet(Request::LLSC)
+            || flags.isSet(Request::STRICT_ORDER))
+            && !readyToExpose()){
+        onlyWaitForExpose(true);
+        // FIXME: reschedule due to LLSC
+        // reuse TLBMiss for now
+        specTLBMiss(true);
+        return NoFault;
+    }
+
     instFlags[ReqMade] = true;
+    instFlags[SpecTLBMiss] = false;
     Request *req = NULL;
     Request *sreqLow = NULL;
     Request *sreqHigh = NULL;
@@ -906,16 +1158,34 @@ BaseDynInst<Impl>::initiateMemRead(Addr addr, unsigned size,
                           thread->contextId());
 
         req->taskId(cpu->taskId());
-
+        if(!readyToExpose()){
+            req->setFlags(Request::SPEC);
+        }
         // Only split the request if the ISA supports unaligned accesses.
         if (TheISA::HasUnalignedMemAcc) {
             splitRequest(req, sreqLow, sreqHigh);
         }
+
         initiateTranslation(req, sreqLow, sreqHigh, NULL, BaseTLB::Read);
+
     }
 
     if (translationCompleted()) {
+        // [SafeSpec] to fix the memory leakage problem
+        // in the case the read is squashed and the request
+        // is never sent out due to a virtual fence ahead
         if (fault == NoFault) {
+            //if (fenceDelay()){
+                //translationStarted(false);
+                //translationCompleted(false);
+                //onlyWaitForFence(true);
+                //delete req;
+                //if (sreqLow){
+                    //delete sreqLow;
+                    //delete sreqHigh;
+                //}
+                //return NoFault;
+            //}
             effAddr = req->getVaddr();
             effSize = size;
             instFlags[EffAddrValid] = true;
@@ -926,10 +1196,30 @@ BaseDynInst<Impl>::initiateMemRead(Addr addr, unsigned size,
                 }
                 reqToVerify = new Request(*req);
             }
+
+            // issue load request [mengjia]
             fault = cpu->read(req, sreqLow, sreqHigh, lqIdx);
         } else {
             // Commit will have to clean up whatever happened.  Set this
             // instruction as executed.
+
+            // [SafeSpec] If it is a fault on translating a spec load
+            // Defer it and retry when it is ready to expose
+            if (!readyToExpose()){
+                translationStarted(false);
+                translationCompleted(false);
+                onlyWaitForExpose(true);
+                specTLBMiss(true);
+                //delete req;
+                //if (sreqLow){
+                //    delete sreqLow;
+                //    delete sreqHigh;
+                //}
+                return NoFault;
+            }
+            // set it as executed and fault flag.
+            // when it enters ROB and try to commit,
+            // the commit stage will squash this inst [mengjia]
             this->setExecuted();
         }
     }
@@ -939,6 +1229,7 @@ BaseDynInst<Impl>::initiateMemRead(Addr addr, unsigned size,
 
     return fault;
 }
+
 
 template<class Impl>
 Fault

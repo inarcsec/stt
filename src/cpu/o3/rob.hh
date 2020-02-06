@@ -68,6 +68,7 @@ class ROB
     typedef std::pair<RegIndex, PhysRegIndex> UnmapInfo;
     typedef typename std::list<DynInstPtr>::iterator InstIt;
 
+
     /** Possible ROB statuses. */
     enum Status {
         Running,
@@ -83,7 +84,7 @@ class ROB
     };
 
   private:
-    /** Per-thread ROB status. */
+    /** Per-thread ROB status. */   // This is never used actually
     Status robStatus[Impl::MaxThreads];
 
     /** ROB resource sharing policy for SMT mode. */
@@ -212,6 +213,10 @@ class ROB
     /** Updates the tail instruction with the new youngest instruction. */
     void updateTail();
 
+    /** [SafeSpce] Updates load instructions visible condition
+     *  set isPrevInstsCompleted and isPrevBrsResolved. */
+    void updateVisibleState();
+
     /** Reads the PC of the oldest head instruction. */
 //    uint64_t readHeadPC();
 
@@ -269,6 +274,21 @@ class ROB
     /** Registers statistics. */
     void regStats();
 
+    /*** [Jiyong, STT] taint/untaint logic run every cycle ***/
+    // compute the taint from the head of ROB all the way until the end of ROB
+    // depends on explicit_flow() and implicit_flow()
+    void compute_taint();
+
+    // compute the number of cycles from an instruction being issued to it being !argsTainted
+    // used to evaluate 
+
+    // print all rob lists including STT informations
+    void print_robs();
+
+    // find a instr in a rob list which has a pending squash, but is not argTaintewhich has a pending squash, but is not argTainted
+    // which means that we should execute this squash
+    DynInstPtr getResolvedPendingSquashInst(ThreadID tid);
+
   private:
     /** Reset the ROB state */
     void resetState();
@@ -293,6 +313,15 @@ class ROB
 
     /** Number of instructions that can be squashed in a single cycle. */
     unsigned squashWidth;
+
+    /*** [Jiyong,STT] explicit flow and implicit flow logic ***/
+    /*   they are private because they can only be called by compute_taint()  */
+    // if this instr has explicit flow wrt its producers
+    void explicit_flow(ThreadID tid, InstIt instIt);
+    // if this instr has explicit flow w.r.t its preceding branches
+    void implicit_flow(ThreadID tid, InstIt instIt);
+    // if this instr has its address tainted(only for memory instructions)
+    void address_flow(ThreadID tid, InstIt instIt);
 
   public:
     /** Iterator pointing to the instruction which is the last instruction

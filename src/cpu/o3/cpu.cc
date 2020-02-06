@@ -414,6 +414,45 @@ FullO3CPU<Impl>::FullO3CPU(DerivO3CPUParams *params)
 
     for (ThreadID tid = 0; tid < this->numThreads; tid++)
         this->thread[tid]->setFuncExeInst(0);
+
+    /*** [Jiyong,mengjia,InvisiSpec,STT] additional configurations ***/
+    isInvisibleSpec = false;
+    allowSpecBufHit = false;
+
+    const std::string threatModel = params->threatModel;
+    if (threatModel.compare("UnsafeBaseline") == 0) {
+        protectionEnabled = false;
+        isFuturistic = false; // not relevant in unsafe mode.
+    } else if (threatModel.compare("Futuristic") == 0) {
+        // "LFENCE" before every load
+        protectionEnabled = true;
+        isFuturistic = true; // send readReq at head of ROB
+    } else if (threatModel.compare("Spectre") == 0) {
+        // "LFENCE" after every branch
+        protectionEnabled = true;
+        isFuturistic = false; // commit when preceding branches are resolved
+    } else {
+        cprintf("ERROR: unsupported threat model: %s!\n", threatModel);
+        exit(1);
+    }
+    needsTSO = params->needsTSO;
+    cprintf("Info: simulation uses threatModel: %s; needsTSO=%d\n", threatModel, needsTSO);
+    // [mengjia] end of setting configuration variables
+
+    /*** [Jiyong, STT] ***/
+    STT = params->STT;
+    impChannel = params->implicitChannel;
+    ifPrintROB = params->ifPrintROB;
+    moreTransmitInsts = params->moreTransmitInsts;
+    cprintf("applySTT = %d, implicit_channel = %d, ifPrintROB = %d, moreTransmitInsts = %d\n",
+            STT, impChannel, ifPrintROB, moreTransmitInsts);
+
+    if (STT)
+        assert (protectionEnabled);
+    if (impChannel)
+        assert (STT);
+
+    assert (moreTransmitInsts >= 0 && moreTransmitInsts <= 2);
 }
 
 template <class Impl>
@@ -593,6 +632,7 @@ FullO3CPU<Impl>::tick()
 
     activityRec.advance();
 
+    DPRINTF(O3CPU, "activityRec.advance() complete\n");
     if (removeInstsThisCycle) {
         cleanUpRemovedInsts();
     }
@@ -610,6 +650,8 @@ FullO3CPU<Impl>::tick()
             schedule(tickEvent, clockEdge(Cycles(1)));
             DPRINTF(O3CPU, "Scheduling next tick!\n");
         }
+    } else {
+        DPRINTF(O3CPU, "tickEvent.scheduled == false, %lu", curTick());
     }
 
     if (!FullSystem)
@@ -1712,6 +1754,13 @@ FullO3CPU<Impl>::cleanUpRemovedInsts()
                 (*removeList.front())->threadNumber,
                 (*removeList.front())->seqNum,
                 (*removeList.front())->pcState());
+
+        auto removed_instit = removeList.front();
+        DynInstPtr removed_inst = *removed_instit;
+        DPRINTF(O3CPU, "Removed instruction: %d refs\n",
+                removed_inst.get()->getCount());
+
+        removed_inst->setRemoved();
 
         instList.erase(removeList.front());
 

@@ -57,6 +57,8 @@
 #include "sim/eventq.hh"
 #include "sim/probe/probe.hh"
 
+#include <list>
+
 struct DerivO3CPUParams;
 
 /**
@@ -574,6 +576,65 @@ class DefaultFetch
     Stats::Formula branchRate;
     /** Number of instruction fetched per cycle. */
     Stats::Formula fetchRate;
+
+    /*** [Jiyong, STT] for delay branch predictor squash **/
+  public:
+    class DelayedSquashReq 
+    {
+        public:
+            /** constructs an empty Req **/
+            DelayedSquashReq()
+                : misp_inst(NULL), doneSeqNum(0), branchTaken(false)
+            {}
+
+            DynInstPtr      misp_inst;
+
+            InstSeqNum      doneSeqNum;
+
+            TheISA::PCState pc;
+
+            bool            branchTaken;
+    };
+
+    // struct used to delay squash
+    class DelayedSquashReqList 
+    {
+        public:
+
+        // queues for delayed squashes
+        std::list<DelayedSquashReq> delayedSquashes[Impl::MaxThreads];
+
+        // push a element
+        void insert(ThreadID tid, DelayedSquashReq &req)
+        {
+            delayedSquashes[tid].push_back(req);
+        }
+
+        // clean squashed squashes
+        void squashReqs(ThreadID tid, InstSeqNum seqNum)
+        {
+            auto it = delayedSquashes[tid].begin();
+            while (it != delayedSquashes[tid].end()) {
+                assert (it->misp_inst);
+                if (it->misp_inst->isSquashed()){
+                    it = delayedSquashes[tid].erase(it);
+                }
+                else if (it->doneSeqNum >= seqNum) {
+                    it = delayedSquashes[tid].erase(it);
+                }
+                else
+                    it++;
+            }
+        }
+
+        bool empty(ThreadID tid)
+        {
+            return delayedSquashes[tid].empty();
+        }
+    };
+
+    DelayedSquashReqList delayedSquashReqList;
+
 };
 
 #endif //__CPU_O3_FETCH_HH__

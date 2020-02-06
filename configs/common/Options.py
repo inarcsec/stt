@@ -278,6 +278,9 @@ def addCommonOptions(parser):
     parser.add_option("-F", "--fast-forward", action="store", type="string",
         default=None,
         help="Number of instructions to fast forward before switching")
+    parser.add_option("--fast-forward-pseudo-inst", action="store_true",
+        default=False,
+        help="Fast forward before switching until hitting switch_cup insts")
     parser.add_option("-S", "--simpoint", action="store_true", default=False,
         help="""Use workload simpoints as an instruction offset for
                 --checkpoint-restore or --take-checkpoint.""")
@@ -291,7 +294,21 @@ def addCommonOptions(parser):
     parser.add_option("--arm-iset", default="arm", type="choice",
                       choices=["arm", "thumb", "aarch64"],
                       help="ARM instruction set.")
-
+    # [SafeSpec] add options to configure needsTSO and scheme
+    parser.add_option("--threat_model", default=None, action="store", type="choice",
+            choices=["UnsafeBaseline", "Spectre", "Futuristic"],
+            help="Threat model selections")
+    parser.add_option("--needsTSO", default=None, action="store", type="int",
+                        help="Select TSO or RC. Set unzero to use TSO.")
+    # [Jiyong,DDIFT] add options for DDIFT configurations
+    parser.add_option("--STT", default=None, action="store", type="int",
+            help="Whether using STT mechanism(threat_model mustn't be Unsafe.")
+    parser.add_option("--implicit_channel", default=None, action="store", type="int",
+            help="Whether enabling defense mechanism for implicit channel")
+    parser.add_option("--ifPrintROB", default=None, action="store", type="int",
+            help="Enable printing ROB content at every cycle")
+    parser.add_option("--moreTransmitInsts", default=None, action="store", type="int",
+            help="Include more transmit instruction types.")
 
 def addSEOptions(parser):
     # Benchmark options

@@ -119,6 +119,15 @@ class DefaultCommit
         SquashAfterPending, //< Committing instructions before a squash.
     };
 
+    const char* ThreadStatus_str[6] = {
+        "Running",
+        "Idle",
+        "ROBSquashing",
+        "TrapPending",
+        "FetchTrapPending",
+        "SquashAfterPending"
+    };
+
     /** Commit policy for SMT mode. */
     enum CommitPolicy {
         Aggressive,
@@ -313,6 +322,14 @@ class DefaultCommit
     /** Returns the thread ID to use based on an oldest instruction policy. */
     ThreadID oldestReady();
 
+    /*** [Jiyong, STT] ***/
+    /** Process the squash signal from IEW stage if a squash needs to be handled at current cycle.
+     *  ifFromIEW=true indicates the current squash signal is from IEW stage
+     *  ifFromIEW=false indicates the current squash signal is from pending mispredicted instr(must enable STT) */
+    void handleSquashSignalFromIEW(ThreadID tid);
+    void handleSquashSignalFromROB(ThreadID tid, DynInstPtr &pendingMispInst);
+
+
   public:
     /** Reads the PC of a specific thread. */
     TheISA::PCState pcState(ThreadID tid) { return pc[tid]; }
@@ -450,6 +467,7 @@ class DefaultCommit
 
     /** The sequence number of the last commited instruction. */
     InstSeqNum lastCommitedSeqNum[Impl::MaxThreads];
+    Tick lastCommitTick;
 
     /** Records if there is a trap currently in flight. */
     bool trapInFlight[Impl::MaxThreads];
@@ -476,8 +494,13 @@ class DefaultCommit
         a possible livelock senario.  */
     bool avoidQuiesceLiveLock;
 
+    int stalled_counter;
+
     /** Updates commit stats based on this instruction. */
     void updateComInstStats(DynInstPtr &inst);
+
+    /** [SafeSpec] Updates squash stats based on this instruction. */
+    void updateSquashStats(DynInstPtr &inst);
 
     /** Stat for the total number of squashed instructions discarded by commit.
      */
@@ -488,6 +511,27 @@ class DefaultCommit
     Stats::Scalar commitNonSpecStalls;
     /** Stat for the total number of branch mispredicts that caused a squash. */
     Stats::Scalar branchMispredicts;
+
+    /*** [Jiyong, STT] other statistics ***/
+    /** Stat for the total number of memory violation that caused a squash. */
+    Stats::Scalar memoryViolations;
+    /** Stat for the total number of delayed branch squashes. */
+    Stats::Scalar stalledBranchMispredicts;
+    /** Stat for the total number of delayed memory violation squashes. */
+    Stats::Scalar stalledMemoryViolations;
+
+    // [SafeSpec] count #squash
+    /** Stat for the total number of invalidation packets
+     * that caused a squash. */
+    Stats::Scalar loadHitInvalidations;
+    Stats::Scalar loadHitExternalEvictions;
+    /** Stat for the total number of failed validations
+     * that caused a squash. */
+    Stats::Scalar loadValidationFails;
+    // [SafeSpec] count cycles stall due to waiting for
+    // validation responses
+    Stats::Scalar validationStalls;
+
     /** Distribution of the number of committed instructions each cycle. */
     Stats::Distribution numCommittedDist;
 

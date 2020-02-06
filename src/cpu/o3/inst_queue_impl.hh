@@ -399,6 +399,13 @@ InstructionQueue<Impl>::regStats()
         .desc("Number of vector alu accesses")
         .flags(total);
 
+    instsSetReady
+        .name(name() + ".instsSetReady")
+        .desc("Number of instructions added to ready list");
+
+    instsStalledBeforeSetReady
+        .name(name() + ".instsStalledBeforeSetReady")
+        .desc("Number of instructions stalled before being added to ready list");
 }
 
 template <class Impl>
@@ -428,8 +435,9 @@ InstructionQueue<Impl>::resetState()
     }
 
     for (int i = 0; i < Num_OpClasses; ++i) {
-        while (!readyInsts[i].empty())
+        while (!readyInsts[i].empty()) {
             readyInsts[i].pop();
+        }
         queueOnList[i] = false;
         readyIt[i] = listOrder.end();
     }
@@ -1008,7 +1016,7 @@ InstructionQueue<Impl>::wakeDependents(DynInstPtr &completed_inst)
         intInstQueueWakeupAccesses++;
     }
 
-    DPRINTF(IQ, "Waking dependents of completed instruction.\n");
+    DPRINTF(IQ, "Waking dependents of completed instruction [sn:%lli].\n", completed_inst->seqNum);
 
     assert(!completed_inst->isSquashed());
 
@@ -1021,8 +1029,7 @@ InstructionQueue<Impl>::wakeDependents(DynInstPtr &completed_inst)
     if (completed_inst->isMemRef()) {
         memDepUnit[completed_inst->threadNumber].wakeDependents(completed_inst);
         completeMemInst(completed_inst);
-    } else if (completed_inst->isMemBarrier() ||
-               completed_inst->isWriteBarrier()) {
+    } else if (completed_inst->isMemBarrier() || completed_inst->isWriteBarrier()) {
         memDepUnit[completed_inst->threadNumber].completeBarrier(completed_inst);
     }
 
@@ -1077,6 +1084,41 @@ InstructionQueue<Impl>::wakeDependents(DynInstPtr &completed_inst)
     return dependents;
 }
 
+
+/*** [Jiyong,STT] ***/
+template <class Impl>
+void
+InstructionQueue<Impl>::wakeUntaintInsts()
+{
+    assert (cpu->STT);
+
+    list<ThreadID>::iterator threads = activeThreads->begin();
+    list<ThreadID>::iterator end     = activeThreads->end();
+
+    DPRINTF(IQ, "wakeUntaintInsts begin.\n");
+
+    while (threads != end) {
+        ThreadID tid = *threads++;
+        for(auto it = stalledTaintedInstList[tid].begin(); it != stalledTaintedInstList[tid].end(); ) {
+            DynInstPtr inst = *it;
+            if (inst->isSquashed()) {
+                inst->removeFromStallList();
+                it = stalledTaintedInstList[tid].erase(it);
+            }
+            else if (inst->readyToIssue_UT()) {
+                inst->removeFromStallList();
+                addIfReady(inst);
+                it = stalledTaintedInstList[tid].erase(it);
+            }
+            else {
+                it++;
+            }
+        }
+    }
+
+    DPRINTF(IQ, "wakeUntaintInsts done.\n");
+}
+
 template <class Impl>
 void
 InstructionQueue<Impl>::addReadyMemInst(DynInstPtr &ready_inst)
@@ -1084,6 +1126,7 @@ InstructionQueue<Impl>::addReadyMemInst(DynInstPtr &ready_inst)
     OpClass op_class = ready_inst->opClass();
 
     readyInsts[op_class].push(ready_inst);
+    instsSetReady++;
 
     // Will need to reorder the list if either a queue is not on the list,
     // or it has an older instruction than last time.
@@ -1095,7 +1138,7 @@ InstructionQueue<Impl>::addReadyMemInst(DynInstPtr &ready_inst)
         addToOrderList(op_class);
     }
 
-    DPRINTF(IQ, "Instruction is ready to issue, putting it onto "
+    DPRINTF(IQ, "(addReadyMemInst) Instruction is ready to issue, putting it onto "
             "the ready list, PC %s opclass:%i [sn:%lli].\n",
             ready_inst->pcState(), op_class, ready_inst->seqNum);
 }
@@ -1172,12 +1215,23 @@ InstructionQueue<Impl>::getDeferredMemInstToExecute()
 {
     for (ListIt it = deferredMemInsts.begin(); it != deferredMemInsts.end();
          ++it) {
-        if ((*it)->translationCompleted() || (*it)->isSquashed()) {
+        // [SafeSpec] we need to check the FenceDelay
+        // a load can be delayed due to
+        // 1. translation delay
+        // 2. virtual fence ahead
+        // 3. not ready to expose and gets a TLB miss
+        // for both (2, 3) we need to restart the translation
+        if ( (*it)->translationCompleted() || (*it)->isSquashed()
+                || ((*it)->onlyWaitForFence() && !(*it)->fenceDelay())
+                || ((*it)->onlyWaitForExpose() && (*it)->readyToExpose())) {
             DynInstPtr mem_inst = *it;
+            mem_inst->onlyWaitForFence(false);
+            mem_inst->onlyWaitForExpose(false);
             deferredMemInsts.erase(it);
             return mem_inst;
         }
     }
+
     return nullptr;
 }
 
@@ -1433,36 +1487,81 @@ InstructionQueue<Impl>::addIfReady(DynInstPtr &inst)
 {
     // If the instruction now has all of its source registers
     // available, then add it to the list of ready instructions.
-    if (inst->readyToIssue()) {
+    if (!cpu->protectionEnabled || !cpu->STT || !cpu->moreTransmitInsts) {
+        if (inst->readyToIssue()) {
+            //Add the instruction to the proper ready list.
+            if (inst->isMemRef()) {
 
-        //Add the instruction to the proper ready list.
-        if (inst->isMemRef()) {
+                DPRINTF(IQ, "(regular) Checking if memory instruction [sn:%lli] can issue.\n", inst->seqNum);
 
-            DPRINTF(IQ, "Checking if memory instruction can issue.\n");
+                // Message to the mem dependence unit that this instruction has
+                // its registers ready.
+                memDepUnit[inst->threadNumber].regsReady(inst);
 
-            // Message to the mem dependence unit that this instruction has
-            // its registers ready.
-            memDepUnit[inst->threadNumber].regsReady(inst);
+                return;
+            }
 
-            return;
+            OpClass op_class = inst->opClass();
+
+            DPRINTF(IQ, "(addIfReady, regular) Instruction is ready to issue, putting it onto "
+                    "the ready list, PC %s opclass:%i [sn:%lli].\n",
+                    inst->pcState(), op_class, inst->seqNum);
+
+            readyInsts[op_class].push(inst);
+            instsSetReady++;
+
+            // Will need to reorder the list if either a queue is not on the list,
+            // or it has an older instruction than last time.
+            if (!queueOnList[op_class]) {
+                addToOrderList(op_class);
+            } else if (readyInsts[op_class].top()->seqNum  <
+                       (*readyIt[op_class]).oldestInst) {
+                listOrder.erase(readyIt[op_class]);
+                addToOrderList(op_class);
+            }
         }
+    }
+    else {  // protectionEnabled && cpu->STT && moreTransmitInsts
+        assert (cpu->STT && cpu->moreTransmitInsts);
+        if (inst->readyToIssue_UT()) {
+            //Add the instruction to the proper ready list.
+            if (inst->isMemRef()) {
 
-        OpClass op_class = inst->opClass();
+                DPRINTF(IQ, "(strict) Checking if memory instruction [sn:%lli] can issue.\n", inst->seqNum);
 
-        DPRINTF(IQ, "Instruction is ready to issue, putting it onto "
-                "the ready list, PC %s opclass:%i [sn:%lli].\n",
-                inst->pcState(), op_class, inst->seqNum);
+                // Message to the mem dependence unit that this instruction has
+                // its registers ready.
+                memDepUnit[inst->threadNumber].regsReady(inst);
 
-        readyInsts[op_class].push(inst);
+                return;
+            }
 
-        // Will need to reorder the list if either a queue is not on the list,
-        // or it has an older instruction than last time.
-        if (!queueOnList[op_class]) {
-            addToOrderList(op_class);
-        } else if (readyInsts[op_class].top()->seqNum  <
-                   (*readyIt[op_class]).oldestInst) {
-            listOrder.erase(readyIt[op_class]);
-            addToOrderList(op_class);
+            OpClass op_class = inst->opClass();
+
+            DPRINTF(IQ, "(addIfReady, strict) Instruction is ready to issue, putting it onto "
+                    "the ready list, PC %s opclass:%i [sn:%lli].\n",
+                    inst->pcState(), op_class, inst->seqNum);
+
+            readyInsts[op_class].push(inst);
+            instsSetReady++;
+
+            // Will need to reorder the list if either a queue is not on the list,
+            // or it has an older instruction than last time.
+            if (!queueOnList[op_class]) {
+                addToOrderList(op_class);
+            } else if (readyInsts[op_class].top()->seqNum  <
+                       (*readyIt[op_class]).oldestInst) {
+                listOrder.erase(readyIt[op_class]);
+                addToOrderList(op_class);
+            }
+        } else if (inst->readyToIssue()) {
+            // [Jiyong, STT]: if ready but tainted, we put it in stallList
+            assert (inst->isArgsTainted());
+            if (!inst->isInStallList()) {
+                inst->addToStallList();
+                stalledTaintedInstList[inst->threadNumber].push_back(inst);
+                instsStalledBeforeSetReady++;
+            }
         }
     }
 }

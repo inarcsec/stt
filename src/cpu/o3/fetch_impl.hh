@@ -1001,6 +1001,7 @@ DefaultFetch<Impl>::checkSignalsAndUpdate(ThreadID tid)
         stalls[tid].decode = false;
     }
 
+    /*** [Jiyong, STT] delay branch predictor updates until tainted branch is untainted ***/
     // Check squash signals from commit.
     if (fromCommit->commitInfo[tid].squash) {
 
@@ -1016,20 +1017,59 @@ DefaultFetch<Impl>::checkSignalsAndUpdate(ThreadID tid)
         // invalid state we generated in after sequence number
         if (fromCommit->commitInfo[tid].mispredictInst &&
             fromCommit->commitInfo[tid].mispredictInst->isControl()) {
-            branchPred->squash(fromCommit->commitInfo[tid].doneSeqNum,
-                              fromCommit->commitInfo[tid].pc,
-                              fromCommit->commitInfo[tid].branchTaken,
-                              tid);
+
+            if ((cpu->STT && cpu->impChannel) && fromCommit->commitInfo[tid].mispredictInst->isArgsTainted()) { 
+                // the squashed branch is tainted, which we must delay
+                DelayedSquashReq delayedReq;
+                delayedReq.misp_inst   = fromCommit->commitInfo[tid].mispredictInst;
+                delayedReq.doneSeqNum  = fromCommit->commitInfo[tid].doneSeqNum;
+                delayedReq.pc          = fromCommit->commitInfo[tid].pc;
+                delayedReq.branchTaken = fromCommit->commitInfo[tid].branchTaken;
+                delayedSquashReqList.insert(tid, delayedReq);
+            }
+            else {
+                // do the squash since we are not in eager scheme or the branch is not tainted
+                branchPred->squash(fromCommit->commitInfo[tid].doneSeqNum,
+                                   fromCommit->commitInfo[tid].pc,
+                                   fromCommit->commitInfo[tid].branchTaken,
+                                   tid);
+                delayedSquashReqList.squashReqs(tid, fromCommit->commitInfo[tid].doneSeqNum);
+            }
         } else {
-            branchPred->squash(fromCommit->commitInfo[tid].doneSeqNum,
-                              tid);
+            branchPred->squash(fromCommit->commitInfo[tid].doneSeqNum, tid);
+            delayedSquashReqList.squashReqs(tid, fromCommit->commitInfo[tid].doneSeqNum);
         }
 
         return true;
     } else if (fromCommit->commitInfo[tid].doneSeqNum) {
         // Update the branch predictor if it wasn't a squashed instruction
-        // that was broadcasted.
+        // that was broadcasted.(signaled by committed instructions)
         branchPred->update(fromCommit->commitInfo[tid].doneSeqNum, tid);
+        delayedSquashReqList.squashReqs(tid, fromCommit->commitInfo[tid].doneSeqNum);
+    } else {
+        // there is no squash/update signal from commit in current cycle.
+        // We will squash branch predictor if there is outstanding branch untainted
+        if (!delayedSquashReqList.empty(tid)) {
+            assert (cpu->STT && cpu->impChannel);
+            InstSeqNum squashedSeqNum = 0;
+            for (auto it = delayedSquashReqList.delayedSquashes[tid].begin();
+                      it != delayedSquashReqList.delayedSquashes[tid].end();
+                      it++) {
+                if (!it->misp_inst->isArgsTainted()) {
+                    branchPred->squash(it->doneSeqNum,
+                                       it->pc,
+                                       it->branchTaken,
+                                       tid);
+                    squashedSeqNum = it->doneSeqNum;
+                    it = delayedSquashReqList.delayedSquashes[tid].erase(it);
+                    break;
+                }
+            }
+
+            if (squashedSeqNum) {
+                delayedSquashReqList.squashReqs(tid, squashedSeqNum);
+            }
+        }
     }
 
     // Check squash signals from decode.
@@ -1043,9 +1083,11 @@ DefaultFetch<Impl>::checkSignalsAndUpdate(ThreadID tid)
                               fromDecode->decodeInfo[tid].nextPC,
                               fromDecode->decodeInfo[tid].branchTaken,
                               tid);
+            delayedSquashReqList.squashReqs(tid, fromDecode->commitInfo[tid].doneSeqNum);
         } else {
             branchPred->squash(fromDecode->decodeInfo[tid].doneSeqNum,
                               tid);
+            delayedSquashReqList.squashReqs(tid, fromDecode->commitInfo[tid].doneSeqNum);
         }
 
         if (fetchStatus[tid] != Squashing) {

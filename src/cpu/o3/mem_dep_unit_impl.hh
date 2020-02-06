@@ -178,6 +178,8 @@ MemDepUnit<MemDepPred, Impl>::insert(DynInstPtr &inst)
     MemDepEntryPtr inst_entry = std::make_shared<MemDepEntry>(inst);
 
     // Add the MemDepEntry to the hash.
+    DPRINTF(MemDepUnit, "Insert instruction PC %s [sn:%lli] to memDep Hash\n",
+            inst->pcState(), inst->seqNum);
     memDepHash.insert(
         std::pair<InstSeqNum, MemDepEntryPtr>(inst->seqNum, inst_entry));
 #ifdef DEBUG
@@ -275,6 +277,8 @@ MemDepUnit<MemDepPred, Impl>::insertNonSpec(DynInstPtr &inst)
     MemDepEntryPtr inst_entry = std::make_shared<MemDepEntry>(inst);
 
     // Insert the MemDepEntry into the hash.
+    DPRINTF(MemDepUnit, "Insert non-speculative instruction PC %s [sn:%lli] to memDep Hash\n",
+            inst->pcState(), inst->seqNum);
     memDepHash.insert(
         std::pair<InstSeqNum, MemDepEntryPtr>(inst->seqNum, inst_entry));
 #ifdef DEBUG
@@ -326,6 +330,8 @@ MemDepUnit<MemDepPred, Impl>::insertBarrier(DynInstPtr &barr_inst)
     MemDepEntryPtr inst_entry = std::make_shared<MemDepEntry>(barr_inst);
 
     // Add the MemDepEntry to the hash.
+    DPRINTF(MemDepUnit, "Insert barrier instruction PC %s [sn:%lli] to memDep Hash\n",
+            barr_inst->pcState(), barr_inst->seqNum);
     memDepHash.insert(
         std::pair<InstSeqNum, MemDepEntryPtr>(barr_sn, inst_entry));
 #ifdef DEBUG

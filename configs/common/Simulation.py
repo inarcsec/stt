@@ -78,7 +78,7 @@ def setCPUClass(options):
         if options.restore_with_cpu != options.cpu_type:
             CPUClass = TmpClass
             TmpClass, test_mem_mode = getCPUClass(options.restore_with_cpu)
-    elif options.fast_forward:
+    elif options.fast_forward or options.fast_forward_pseudo_inst:
         CPUClass = TmpClass
         TmpClass = AtomicSimpleCPU
         test_mem_mode = 'atomic'
@@ -437,6 +437,9 @@ def run(options, root, testsys, cpu_class):
     if options.fast_forward and options.checkpoint_restore != None:
         fatal("Can't specify both --fast-forward and --checkpoint-restore")
 
+    if options.fast_forward_pseudo_inst and options.checkpoint_restore != None:
+        fatal("Can't specify both --fast-forward-pseudo-inst and --checkpoint-restore")
+
     if options.standard_switch and not options.caches:
         fatal("Must specify --caches when using --standard-switch")
 
@@ -460,6 +463,14 @@ def run(options, root, testsys, cpu_class):
     if cpu_class:
         switch_cpus = [cpu_class(switched_out=True, cpu_id=(i))
                        for i in xrange(np)]
+
+        # [SafeSpec] configure simualtion scheme
+        if cpu_class == DerivO3CPU:
+            #fatal("Ruby can only be used with DerivO3CPU!")
+            CpuConfig.config_scheme(cpu_class, switch_cpus, options)
+        else:
+            warn("restoring from a checkpoint, "
+                "but not simulate using DerivO3CPU.")
 
         for i in xrange(np):
             if options.fast_forward:
@@ -548,8 +559,8 @@ def run(options, root, testsys, cpu_class):
                 testsys.cpu[i].max_insts_any_thread = \
                     testsys.cpu[i].workload[0].simpoint
             # No distance specified, just switch
-            else:
-                testsys.cpu[i].max_insts_any_thread = 1
+            # else:
+                # testsys.cpu[i].max_insts_any_thread = 1
 
             # warmup period
             if options.warmup_insts:
@@ -648,9 +659,18 @@ def run(options, root, testsys, cpu_class):
             print "Switch at instruction count:%s" % \
                     str(testsys.cpu[0].max_insts_any_thread)
             exit_event = m5.simulate()
+        elif cpu_class and options.fast_forward_pseudo_inst:
+            print "Switch at beginning of ROI"
+            exit_event = m5.simulate()
         else:
             print "Switch at curTick count:%s" % str(10000)
             exit_event = m5.simulate(10000)
+
+        if options.fast_forward_pseudo_inst:
+            while exit_event.getCause() != 'switchcpu':
+                print 'Exiting @ tick %i because %s' % (m5.curTick(), exit_event.getCause())
+                exit_event = m5.simulate()
+
         print "Switched CPUS @ tick %s" % (m5.curTick())
 
         m5.switchCpus(testsys, switch_cpu_list)
@@ -697,7 +717,7 @@ def run(options, root, testsys, cpu_class):
         restoreSimpointCheckpoint()
 
     else:
-        if options.fast_forward:
+        if options.fast_forward or options.fast_forward_pseudo_inst:
             m5.stats.reset()
         print "**** REAL SIMULATION ****"
 
@@ -709,6 +729,7 @@ def run(options, root, testsys, cpu_class):
         else:
             exit_event = benchCheckpoints(options, maxtick, cptdir)
 
+    m5.stats.dump()
     print 'Exiting @ tick %i because %s' % (m5.curTick(), exit_event.getCause())
     if options.checkpoint_at_end:
         m5.checkpoint(joinpath(cptdir, "cpt.%d"))

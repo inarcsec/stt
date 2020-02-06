@@ -78,6 +78,8 @@ class RefCounted
      * do.  We don't ever delete a "void *".
      */
     virtual ~RefCounted() {}
+    
+    int getCount() { return count; }
 
     /// Increment the reference count
     void incref() { ++count; }

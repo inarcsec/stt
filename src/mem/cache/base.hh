@@ -120,7 +120,7 @@ class BaseCache : public MemObject
          */
         void schedSendEvent(Tick time)
         {
-            DPRINTF(CachePort, "Scheduling send event at %llu\n", time);
+            DPRINTF(CachePort, "Scheduling send event at %llu from MSHR\n", time);
             reqQueue.schedSendEvent(time);
         }
 
@@ -579,6 +579,7 @@ class BaseCache : public MemObject
      */
     void schedMemSideSendEvent(Tick time)
     {
+        DPRINTF(CachePort, "Scheduling send event at %llu from memory side port\n", time);
         memSidePort->schedSendEvent(time);
     }
 

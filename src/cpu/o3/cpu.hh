@@ -47,6 +47,7 @@
 #ifndef __CPU_O3_CPU_HH__
 #define __CPU_O3_CPU_HH__
 
+#include <cstdio>
 #include <iostream>
 #include <list>
 #include <queue>
@@ -57,14 +58,15 @@
 #include "arch/types.hh"
 #include "base/statistics.hh"
 #include "config/the_isa.hh"
+#include "cpu/activity.hh"
+#include "cpu/base.hh"
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/cpu_policy.hh"
 #include "cpu/o3/scoreboard.hh"
 #include "cpu/o3/thread_state.hh"
-#include "cpu/activity.hh"
-#include "cpu/base.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/timebuf.hh"
+
 //#include "cpu/o3/thread_context.hh"
 #include "params/DerivO3CPU.hh"
 #include "sim/process.hh"
@@ -799,6 +801,32 @@ class FullO3CPU : public BaseO3CPU
     //number of misc
     Stats::Scalar miscRegfileReads;
     Stats::Scalar miscRegfileWrites;
+
+    /*** [Jiyong,STT,mengjia,InvisiSpec] Additional configs for O3CPU ***/
+    // invisispec configurations (not used in STT)
+    bool isInvisibleSpec;
+    bool allowSpecBufHit;
+
+    // whether to issue packets in execution stage(false if using Fence)
+    bool protectionEnabled;
+
+    // flag for memory model
+    bool needsTSO;
+
+    // flag for whether defending against spectre attack or futuristic attacks
+    bool isFuturistic;
+
+    // whether to apply STT
+    bool STT;
+
+    // whether add implicit flow protection
+    bool impChannel;
+
+    // whether to print ROBs
+    bool ifPrintROB;
+
+    // whether consider more transmit instructions
+    int moreTransmitInsts;
 };
 
 #endif // __CPU_O3_CPU_HH__

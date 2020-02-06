@@ -58,6 +58,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/timebuf.hh"
 #include "debug/LSQUnit.hh"
+#include "debug/JY.hh"
 #include "mem/packet.hh"
 #include "mem/port.hh"
 
@@ -136,6 +137,12 @@ class LSQUnit {
      */
     void checkSnoop(PacketPtr pkt);
 
+    // [SafeSpec] check whether current request will hit in the
+    // spec buffer or not
+    int checkSpecBuffHit(const RequestPtr req, const int req_idx);
+    void setSpecBuffState(const RequestPtr req);
+
+    bool checkPrevLoadsExecuted(const int req_idx);
     /** Executes a load instruction. */
     Fault executeLoad(DynInstPtr &inst);
 
@@ -153,6 +160,15 @@ class LSQUnit {
 
     /** Writes back stores. */
     void writebackStores();
+
+    /** [mengjia] Validate loads. */
+    int exposeLoads();
+
+    /** [mengjia] Update Visbible State.
+     * In the mode defence relying on fence: setup fenceDelay state.
+     * In the mode defence relying on invisibleSpec:
+     * setup readyToExpose*/
+    void updateVisibleState();
 
     /** Completes the data access that has been returned from the
      * memory system. */
@@ -219,6 +235,8 @@ class LSQUnit {
 
     /** Returns the number of stores to writeback. */
     int numStoresToWB() { return storesToWB; }
+    /** [SafeSpec] Returns the number of loads to validate. */
+    int numLoadsToVLD() { return loadsToVLD; }
 
     /** Returns if the LSQ unit will writeback on this cycle. */
     bool willWB() { return storeQueue[storeWBIdx].canWB &&
@@ -235,17 +253,29 @@ class LSQUnit {
     /** Writes back the instruction, sending it to IEW. */
     void writeback(DynInstPtr &inst, PacketPtr pkt);
 
+    // [SafeSpec] complete Validates
+    void completeValidate(DynInstPtr &inst, PacketPtr pkt);
+
     /** Writes back a store that couldn't be completed the previous cycle. */
     void writebackPendingStore();
 
+    /** Validates a load that couldn't be completed the previous cycle. */
+    //void validatePendingLoad();
+
     /** Handles completing the send of a store to memory. */
     void storePostSend(PacketPtr pkt);
+
+    /** Handles completing the send of a validation to memory. */
+    //void validationPostSend(PacketPtr pkt, int loadVLDIdx);
 
     /** Completes the store at the specified index. */
     void completeStore(int store_idx);
 
     /** Attempts to send a store to the cache. */
     bool sendStore(PacketPtr data_pkt);
+
+    /** Attempts to send a validation to the cache. */
+    //bool sendValidation(PacketPtr data_pkt, int loadVLDIdx);
 
     /** Increments the given store index (circular queue). */
     inline void incrStIdx(int &store_idx) const;
@@ -308,6 +338,7 @@ class LSQUnit {
         /** Completes a packet and returns whether the access is finished. */
         inline bool complete() { return --outstanding == 0; }
     };
+
 
     /** Writeback event, specifically for when stores forward data to loads. */
     class WritebackEvent : public Event {
@@ -409,6 +440,8 @@ class LSQUnit {
 
     /** The number of load instructions in the LQ. */
     int loads;
+    /** [mengjia] The number of store instructions in the SQ waiting to writeback. */
+    int loadsToVLD;
     /** The number of store instructions in the SQ. */
     int stores;
     /** The number of store instructions in the SQ waiting to writeback. */
@@ -416,6 +449,10 @@ class LSQUnit {
 
     /** The index of the head instruction in the LQ. */
     int loadHead;
+    /** [mengjia] The index of the first instruction that may be ready to be
+     * validated, and has not yet been validated.
+     */
+    //int pendingLoadVLDIdx;
     /** The index of the tail instruction in the LQ. */
     int loadTail;
 
@@ -432,7 +469,7 @@ class LSQUnit {
     /** The number of cache ports available each cycle (stores only). */
     int cacheStorePorts;
 
-    /** The number of used cache ports in this cycle by stores. */
+    /** [SafeSpec] The number of used cache ports in this cycle by stores. */
     int usedStorePorts;
 
     //list<InstSeqNum> mshrSeqNums;
@@ -458,6 +495,9 @@ class LSQUnit {
     /** Whehter or not a store is blocked due to the memory system. */
     bool isStoreBlocked;
 
+    /** Whehter or not a validation is blocked due to the memory system. */
+    bool isValidationBlocked;
+    
     /** Whether or not a store is in flight. */
     bool storeInFlight;
 
@@ -471,14 +511,12 @@ class LSQUnit {
     /** The packet that is pending free cache ports. */
     PacketPtr pendingPkt;
 
-    /** Flag for memory model. */
-    bool needsTSO;
-
     // Will also need how many read/write ports the Dcache has.  Or keep track
     // of that in stage that is one level up, and only call executeLoad/Store
     // the appropriate number of times.
     /** Total number of loads forwaded from LSQ stores. */
     Stats::Scalar lsqForwLoads;
+    Stats::Scalar taintedlsqForwLoads;
 
     /** Total number of loads ignored due to invalid addresses. */
     Stats::Scalar invAddrLoads;
@@ -508,7 +546,16 @@ class LSQUnit {
     /** Number of times the LSQ is blocked due to the cache. */
     Stats::Scalar lsqCacheBlocked;
 
+    Stats::Scalar specBuffHits;
+    Stats::Scalar specBuffMisses;
+    Stats::Scalar numValidates;
+    Stats::Scalar numExposes;
+    Stats::Scalar numConvertedExposes;
+
+
   public:
+    void print_lsq() const;
+
     /** Executes the load at the given index. */
     Fault read(Request *req, Request *sreqLow, Request *sreqHigh,
                int load_idx);
@@ -547,6 +594,8 @@ class LSQUnit {
     bool isStalled()  { return stalled; }
 };
 
+
+// IMPORTANT: the function to issue packets, interact with memory [mengjia]
 template <class Impl>
 Fault
 LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
@@ -555,8 +604,6 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
     DynInstPtr load_inst = loadQueue[load_idx];
 
     assert(load_inst);
-
-    assert(!load_inst->isExecuted());
 
     // Make sure this isn't a strictly ordered load
     // A bit of a hackish way to get strictly ordered accesses to work
@@ -583,6 +630,8 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
     }
 
     // Check the SQ for any previous stores that might lead to forwarding
+    // why we have store queue index for a load operation? [mengjia]
+    // load_inst->sqIdx is the youngest store in store queue when load is inserted in load queue
     int store_idx = load_inst->sqIdx;
 
     int store_size = 0;
@@ -592,6 +641,7 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
             load_idx, store_idx, storeHead, req->getPaddr(),
             sreqLow ? " split" : "");
 
+    // LLSC: load-link/store-conditional [mengjia]
     if (req->isLLSC()) {
         assert(!sreqLow);
         // Disable recording the result temporarily.  Writing to misc
@@ -602,12 +652,14 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
         load_inst->recordResult(true);
     }
 
+    // request to memory mapped register [mengjia]
     if (req->isMmappedIpr()) {
         assert(!load_inst->memData);
         load_inst->memData = new uint8_t[64];
 
         ThreadContext *thread = cpu->tcBase(lsqID);
         Cycles delay(0);
+
         PacketPtr data_pkt = new Packet(req, MemCmd::ReadReq);
 
         data_pkt->dataStatic(load_inst->memData);
@@ -636,6 +688,7 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
         return NoFault;
     }
 
+    // Here is store-load forwarding logic
     while (store_idx != -1) {
         // End once we've reached the top of the LSQ
         if (store_idx == storeWBIdx) {
@@ -678,40 +731,88 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
         // If the store's data has all of the data needed and the load isn't
         // LLSC, we can forward.
         if (store_has_lower_limit && store_has_upper_limit && !req->isLLSC()) {
-            // Get shift amount for offset into the store's data.
-            int shift_amt = req->getVaddr() - storeQueue[store_idx].inst->effAddr;
+            // we DO Forwarding
+            /***** [Jiyong, STT] if store addr is tainted, load addr is untainted, we still needs to issue a normal load without writeback" **/
+            if (cpu->STT && cpu->impChannel && (storeQueue[store_idx].inst->isAddrTainted() && !load_inst->isAddrTainted())) {
+                /*
+                 * here we do ld-st forwarding. But since store address is tainted, we also launch normal load afterwards
+                 */
+                // Get shift amount for offset into the store's data.
+                int shift_amt = req->getVaddr() - storeQueue[store_idx].inst->effAddr;
 
-            // Allocate memory if this is the first time a load is issued.
-            if (!load_inst->memData) {
-                load_inst->memData = new uint8_t[req->getSize()];
+                // Allocate memory if this is the first time a load is issued.
+                if (!load_inst->stFwdData) {
+                    load_inst->stFwdData = new uint8_t[req->getSize()];
+                    load_inst->stFwdDataSize = req->getSize();
+                }
+                if (storeQueue[store_idx].isAllZeros)
+                    memset(load_inst->stFwdData, 0, req->getSize());
+                else
+                    memcpy(load_inst->stFwdData,
+                        storeQueue[store_idx].data + shift_amt, req->getSize());
+
+                DPRINTF(LSQUnit, "Forwarding from store idx %i to load to "
+                        "addr %#x\n", store_idx, req->getVaddr());
+                DPRINTF(LSQUnit, "Still need dummy load to hide tainted address of store");
+
+                // Jiyong, STT: writeback is deferred to GETS writeback
+                //PacketPtr data_pkt = new Packet(req, MemCmd::ReadReq);
+                //data_pkt->dataStatic(load_inst->stFwdData);
+
+                //WritebackEvent *wb = new WritebackEvent(load_inst, data_pkt, this);
+
+                // We'll say this has a 1 cycle load-store forwarding latency
+                // for now.
+                // @todo: Need to make this a parameter.
+                //cpu->schedule(wb, curTick());
+                load_inst->alreadyForwarded = true;
+
+                break;
+                // Don't need to do anything special for split loads.
+                //if (TheISA::HasUnalignedMemAcc && sreqLow) {
+                    //delete sreqLow;
+                    //delete sreqHigh;
+                //}
+
+                //return NoFault;
+
+            } else {
+                // Get shift amount for offset into the store's data.
+                int shift_amt = req->getVaddr() - storeQueue[store_idx].inst->effAddr;
+
+                // Allocate memory if this is the first time a load is issued.
+                if (!load_inst->memData) {
+                    load_inst->memData = new uint8_t[req->getSize()];
+                }
+                if (storeQueue[store_idx].isAllZeros)
+                    memset(load_inst->memData, 0, req->getSize());
+                else
+                    memcpy(load_inst->memData,
+                        storeQueue[store_idx].data + shift_amt, req->getSize());
+
+                DPRINTF(LSQUnit, "Forwarding from store idx %i to load to "
+                        "addr %#x\n", store_idx, req->getVaddr());
+                DPRINTF(LSQUnit, "Not need to dummy load, therefore load is done.");
+
+                PacketPtr data_pkt = new Packet(req, MemCmd::ReadReq);
+                data_pkt->dataStatic(load_inst->memData);
+
+                WritebackEvent *wb = new WritebackEvent(load_inst, data_pkt, this);
+
+                // We'll say this has a 1 cycle load-store forwarding latency
+                // for now.
+                // @todo: Need to make this a parameter.
+                cpu->schedule(wb, curTick());
+                ++lsqForwLoads;
+
+                // Don't need to do anything special for split loads.
+                if (TheISA::HasUnalignedMemAcc && sreqLow) {
+                    delete sreqLow;
+                    delete sreqHigh;
+                }
+
+                return NoFault;
             }
-            if (storeQueue[store_idx].isAllZeros)
-                memset(load_inst->memData, 0, req->getSize());
-            else
-                memcpy(load_inst->memData,
-                    storeQueue[store_idx].data + shift_amt, req->getSize());
-
-            DPRINTF(LSQUnit, "Forwarding from store idx %i to load to "
-                    "addr %#x\n", store_idx, req->getVaddr());
-
-            PacketPtr data_pkt = new Packet(req, MemCmd::ReadReq);
-            data_pkt->dataStatic(load_inst->memData);
-
-            WritebackEvent *wb = new WritebackEvent(load_inst, data_pkt, this);
-
-            // We'll say this has a 1 cycle load-store forwarding latency
-            // for now.
-            // @todo: Need to make this a parameter.
-            cpu->schedule(wb, curTick());
-
-            // Don't need to do anything special for split loads.
-            if (TheISA::HasUnalignedMemAcc && sreqLow) {
-                delete sreqLow;
-                delete sreqHigh;
-            }
-
-            ++lsqForwLoads;
-            return NoFault;
         } else if (
                 (!req->isLLSC() &&
                  ((store_has_lower_limit && lower_load_has_store_part) ||
@@ -766,10 +867,10 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
 
             return NoFault;
         }
-    }
+    } // load store forwarding check done
 
     // If there's no forwarding case, then go access memory
-    DPRINTF(LSQUnit, "Doing memory access for inst [sn:%lli] PC %s\n",
+    DPRINTF(LSQUnit, "Doing memory access (normal load) for inst [sn:%lli] PC %s\n",
             load_inst->seqNum, load_inst->pcState());
 
     // Allocate memory if this is the first time a load is issued.
@@ -779,9 +880,33 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
 
     // if we the cache is not blocked, do cache access
     bool completedFirst = false;
-    PacketPtr data_pkt = Packet::createRead(req);
+
+    PacketPtr data_pkt = NULL;
     PacketPtr fst_data_pkt = NULL;
     PacketPtr snd_data_pkt = NULL;
+
+    // According to the isInsivisibleSpec variable to create
+    // corresponding type of packets [mengjia]
+    bool sendSpecRead = false;
+    if (cpu->isInvisibleSpec) {
+        if(!load_inst->readyToExpose()){
+            assert(!req->isLLSC());
+            assert(!req->isStrictlyOrdered());
+            assert(!req->isMmappedIpr());
+            sendSpecRead = true;
+            DPRINTF(LSQUnit, "send a spec read for inst [sn:%lli]\n",
+                    load_inst->seqNum);
+        }
+    }
+
+    assert( !(sendSpecRead && load_inst->isSpecCompleted()) &&
+            "Sending specRead twice for the same load insts");
+
+    if(sendSpecRead){
+        data_pkt = Packet::createReadSpec(req);
+    } else {
+        data_pkt = Packet::createRead(req);
+    }
 
     data_pkt->dataStatic(load_inst->memData);
 
@@ -794,17 +919,64 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
     if (!TheISA::HasUnalignedMemAcc || !sreqLow) {
         // Point the first packet at the main data packet.
         fst_data_pkt = data_pkt;
+
+        fst_data_pkt->setFirst();
+        if (sendSpecRead){
+            int src_idx = checkSpecBuffHit(req, load_idx);
+            if (src_idx != -1) {
+                if (cpu->allowSpecBufHit){
+                    data_pkt->setOnlyAccessSpecBuff();
+                }
+                data_pkt->srcIdx = src_idx;
+                specBuffHits++;
+            }else{
+                specBuffMisses++;
+            }
+        }
+        fst_data_pkt->reqIdx = load_idx;
     } else {
         // Create the split packets.
-        fst_data_pkt = Packet::createRead(sreqLow);
-        snd_data_pkt = Packet::createRead(sreqHigh);
+        if(sendSpecRead){
 
+            fst_data_pkt = Packet::createReadSpec(sreqLow);
+            int fst_src_idx = checkSpecBuffHit(sreqLow, load_idx);
+            if ( fst_src_idx != -1 ) {
+                if (cpu->allowSpecBufHit){
+                    fst_data_pkt->setOnlyAccessSpecBuff();
+                }
+                fst_data_pkt->srcIdx = fst_src_idx;
+                specBuffHits++;
+            } else {
+                specBuffMisses++;
+            }
+
+            snd_data_pkt = Packet::createReadSpec(sreqHigh);
+            int snd_src_idx = checkSpecBuffHit(sreqHigh, load_idx);
+            if ( snd_src_idx != -1 ) {
+                if (cpu->allowSpecBufHit){
+                    snd_data_pkt->setOnlyAccessSpecBuff();
+                }
+                snd_data_pkt->srcIdx = snd_src_idx;
+                specBuffHits++;
+            } else {
+                specBuffMisses++;
+            }
+        } else {
+            fst_data_pkt = Packet::createRead(sreqLow);
+            snd_data_pkt = Packet::createRead(sreqHigh);
+        }
+
+        fst_data_pkt->setFirst();
         fst_data_pkt->dataStatic(load_inst->memData);
         snd_data_pkt->dataStatic(load_inst->memData + sreqLow->getSize());
 
         fst_data_pkt->senderState = state;
         snd_data_pkt->senderState = state;
+        fst_data_pkt->reqIdx = load_idx;
+        snd_data_pkt->reqIdx = load_idx;
 
+        fst_data_pkt->isSplit = true;
+        snd_data_pkt->isSplit = true;
         state->isSplit = true;
         state->outstanding = 2;
         state->mainPkt = data_pkt;
@@ -816,6 +988,8 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
     // @todo We should account for cache port contention
     // and arbitrate between loads and stores.
     bool successful_load = true;
+    // MARK: here is the place memory request of read is sent [mengjia]
+    // [SafeSpec] Sending out a memory request
     if (!dcachePort->sendTimingReq(fst_data_pkt)) {
         successful_load = false;
     } else if (TheISA::HasUnalignedMemAcc && sreqLow) {
@@ -871,11 +1045,63 @@ LSQUnit<Impl>::read(Request *req, Request *sreqLow, Request *sreqHigh,
         }
 
         ++lsqCacheBlocked;
+        load_inst->alreadyForwarded = false;
 
         iewStage->blockMemInst(load_inst);
 
         // No fault occurred, even though the interface is blocked.
         return NoFault;
+    }
+
+    DPRINTF(LSQUnit, "successfully sent out packet(s) for inst [sn:%lli]\n",
+            load_inst->seqNum);
+
+    // Set everything ready for expose/validation after the read is
+    // successfully sent out
+    if(sendSpecRead){ // sending actual request
+        // [mengjia] Here we set the needExposeOnly flag
+        if (cpu->needsTSO && !load_inst->isDataPrefetch()){
+            // need to check whether previous load_instructions specComplete or not
+            if ( checkPrevLoadsExecuted(load_idx) ){
+                load_inst->needExposeOnly(true);
+                DPRINTF(LSQUnit, "Set load PC %s, [sn:%lli] as needExposeOnly\n", load_inst->pcState(), load_inst->seqNum);
+            } else {
+                DPRINTF(LSQUnit, "Set load PC %s, [sn:%lli] as needValidation\n", load_inst->pcState(), load_inst->seqNum);
+            }
+        }else{
+            //if RC, always only need expose
+            load_inst->needExposeOnly(true);
+            DPRINTF(LSQUnit, "Set load PC %s, [sn:%lli] as needExposeOnly\n", load_inst->pcState(), load_inst->seqNum);
+        }
+
+        load_inst->needPostFetch(true);
+        assert(!req->isMmappedIpr());
+        //save expose requestPtr
+        if (TheISA::HasUnalignedMemAcc && sreqLow) {
+            load_inst->postSreqLow = new Request(*sreqLow);
+            load_inst->postSreqHigh = new Request(*sreqHigh);
+            load_inst->postReq = NULL;
+        }else{
+            load_inst->postReq = new Request(*req);
+            load_inst->postSreqLow = NULL;
+            load_inst->postSreqHigh = NULL;
+        }
+        load_inst->needDeletePostReq(true);
+        DPRINTF(LSQUnit, "created validation/expose"
+                " request for inst [sn:%lli]"
+                "req=%#x, reqLow=%#x, reqHigh=%#x\n",
+            load_inst->seqNum, (Addr)(load_inst->postReq),
+            (Addr)(load_inst->postSreqLow),
+            (Addr)(load_inst->postSreqHigh));
+    } else {
+        load_inst->setExposeCompleted();
+        load_inst->needPostFetch(false);
+        if (TheISA::HasUnalignedMemAcc && sreqLow) {
+            setSpecBuffState(sreqLow);
+            setSpecBuffState(sreqHigh);
+        } else {
+            setSpecBuffState(req);
+        }
     }
 
     return NoFault;
@@ -916,5 +1142,7 @@ LSQUnit<Impl>::write(Request *req, Request *sreqLow, Request *sreqHigh,
     // can happen here.
     return NoFault;
 }
+
+
 
 #endif // __CPU_O3_LSQ_UNIT_HH__

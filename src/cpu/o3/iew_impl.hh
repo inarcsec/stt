@@ -485,8 +485,8 @@ DefaultIEW<Impl>::squashDueToBranch(DynInstPtr &inst, ThreadID tid)
 
     if (!toCommit->squash[tid] ||
             inst->seqNum < toCommit->squashedSeqNum[tid]) {
-        toCommit->squash[tid] = true;
-        toCommit->squashedSeqNum[tid] = inst->seqNum;
+        toCommit->squash[tid] = true;           // tell commit that you need to squash
+        toCommit->squashedSeqNum[tid] = inst->seqNum;   // tell commit from which instr to squash
         toCommit->branchTaken[tid] = inst->pcState().branching();
 
         TheISA::PCState pc = inst->pcState();
@@ -494,6 +494,9 @@ DefaultIEW<Impl>::squashDueToBranch(DynInstPtr &inst, ThreadID tid)
 
         toCommit->pc[tid] = pc;
         toCommit->mispredictInst[tid] = inst;
+        toCommit->instCausingSquash[tid] = inst;
+
+        // the mispredicted instr itself should not be squashed
         toCommit->includeSquashInst[tid] = false;
 
         wroteToTimeBuffer = true;
@@ -515,11 +518,12 @@ DefaultIEW<Impl>::squashDueToMemOrder(DynInstPtr &inst, ThreadID tid)
     // the squash.
     if (!toCommit->squash[tid] ||
             inst->seqNum <= toCommit->squashedSeqNum[tid]) {
-        toCommit->squash[tid] = true;
+        toCommit->squash[tid] = true;   // tell commit that you need to squash
+        toCommit->squashedSeqNum[tid] = inst->seqNum;   // tell commit from which instr to squash
 
-        toCommit->squashedSeqNum[tid] = inst->seqNum;
         toCommit->pc[tid] = inst->pcState();
         toCommit->mispredictInst[tid] = NULL;
+        toCommit->instCausingSquash[tid] = inst;
 
         // Must include the memory violator in the squash.
         toCommit->includeSquashInst[tid] = true;
@@ -1186,9 +1190,16 @@ DefaultIEW<Impl>::executeInsts()
         fetchRedirect[tid] = false;
     }
 
+    // [mengjia] Validate/Expose any loads which are ready last cycle 
+    // very tricky, need make the state consistent
+    // if we successfully commit sth, then we need to activate the stage or somehow
+    // problems happen when interacting with squash
+    // NOTE: we always send validations before execute load requests 
+    ldstQueue.exposeLoads();
+
     // Uncomment this if you want to see all available instructions.
     // @todo This doesn't actually work anymore, we should fix it.
-//    printAvailableInsts();
+    // printAvailableInsts();
 
     // Execute/writeback any instructions that are available.
     int insts_to_execute = fromIssue->size;
@@ -1235,18 +1246,41 @@ DefaultIEW<Impl>::executeInsts()
             DPRINTF(IEW, "Execute: Calculating address for memory "
                     "reference.\n");
 
+            DPRINTF(IEW, "Execute: %s\n", inst->staticInst->getName());
             // Tell the LDSTQ to execute this instruction (if it is a load).
             if (inst->isLoad()) {
                 // Loads will mark themselves as executed, and their writeback
                 // event adds the instruction to the queue to commit
+
+                // [SafeSpec] a lifetime of a load
+                // always let it translate --> translation not complete, defer
+                // if !loadInExec, need to check whether there
+                // is a virtual fence ahead
+                // --> if existing virtual fence, defer
+                if (inst->fenceDelay()){
+                    DPRINTF(IEW, "Deferring load due to virtual fence.\n");
+                    inst->onlyWaitForFence(true);
+                    instQueue.deferMemInst(inst);
+
+                    continue;
+                }
+
                 fault = ldstQueue.executeLoad(inst);
 
+                // [SafeSpec] delay the load if there is a virtual fence ahead
                 if (inst->isTranslationDelayed() &&
                     fault == NoFault) {
                     // A hw page table walk is currently going on; the
                     // instruction must be deferred.
-                    DPRINTF(IEW, "Execute: Delayed translation, deferring "
-                            "load.\n");
+                    DPRINTF(IEW, "Execute: Delayed translation,  deferring load.\n");
+                    instQueue.deferMemInst(inst);
+                    continue;
+                }
+
+                if ((inst->specTLBMiss() ) &&
+                    fault == NoFault) {
+                    DPRINTF(IEW, "Execute: Speculative load gets a TLB miss,"
+                            " deferring load.\n");
                     instQueue.deferMemInst(inst);
                     continue;
                 }
@@ -1381,10 +1415,11 @@ DefaultIEW<Impl>::executeInsts()
                 ++memOrderViolationEvents;
             }
         }
-    }
+    } 
 
     // Update and record activity if we processed any instructions.
     if (inst_num) {
+        
         if (exeStatus == Idle) {
             exeStatus = Running;
         }
@@ -1448,6 +1483,13 @@ DefaultIEW<Impl>::writebackInsts()
     }
 }
 
+template <class Impl>
+void
+DefaultIEW<Impl>::wakeUntaintInsts()
+{
+    instQueue.wakeUntaintInsts();
+}
+
 template<class Impl>
 void
 DefaultIEW<Impl>::tick()
@@ -1476,10 +1518,15 @@ DefaultIEW<Impl>::tick()
         dispatch(tid);
     }
 
+    ldstQueue.updateVisibleState();
+
     if (exeStatus != Squashing) {
         executeInsts();
 
         writebackInsts();
+
+        if (cpu->STT && cpu->moreTransmitInsts)
+            wakeUntaintInsts();
 
         // Have the instruction queue try to schedule any ready instructions.
         // (In actuality, this scheduling is for instructions that will
@@ -1502,6 +1549,7 @@ DefaultIEW<Impl>::tick()
 
     // Writeback any stores using any leftover bandwidth.
     ldstQueue.writebackStores();
+
 
     // Check the committed load/store signals to see if there's a load
     // or store to commit.  Also check if it's being told to execute a

@@ -53,6 +53,7 @@
 #include "config/the_isa.hh"
 #include "cpu/base_dyn_inst.hh"
 #include "cpu/exetrace.hh"
+#include "cpu/op_class.hh"
 #include "debug/DynInst.hh"
 #include "debug/IQ.hh"
 #include "mem/request.hh"
@@ -87,6 +88,9 @@ void
 BaseDynInst<Impl>::initVars()
 {
     memData = NULL;
+    vldData = NULL;
+    stFwdData = NULL;
+    stFwdDataSize = 0;
     effAddr = 0;
     physEffAddrLow = 0;
     physEffAddrHigh = 0;
@@ -98,6 +102,9 @@ BaseDynInst<Impl>::initVars()
     instFlags.reset();
     instFlags[RecordResult] = true;
     instFlags[Predicate] = true;
+    /*** [Jiyong,STT] ***/
+    instFlags[HasPendingSquash] = false;
+    alreadyForwarded = false;
 
     lqIdx = -1;
     sqIdx = -1;
@@ -132,6 +139,13 @@ BaseDynInst<Impl>::initVars()
 #endif
 
     reqToVerify = NULL;
+    postReq = NULL;
+    postSreqLow = NULL;
+    postSreqHigh = NULL;
+
+    // [Jiyong,STT] set argProducers to nullptr
+    for(int i = 0; i < TheISA::MaxInstSrcRegs; i++)
+        argProducers[i] = DynInstPtr();
 }
 
 template <class Impl>
@@ -139,6 +153,14 @@ BaseDynInst<Impl>::~BaseDynInst()
 {
     if (memData) {
         delete [] memData;
+    }
+
+    if (stFwdData) {
+        delete [] stFwdData;
+    }
+
+    if (vldData) {
+        delete [] vldData;
     }
 
     if (traceData) {
@@ -160,6 +182,19 @@ BaseDynInst<Impl>::~BaseDynInst()
 
     if (reqToVerify)
         delete reqToVerify;
+
+    if (needDeletePostReq()){
+        if (postReq){
+            delete postReq;
+            postReq = NULL;
+        }
+        if (postSreqLow) {
+            delete postSreqLow;
+            delete postSreqHigh;
+            postSreqLow = NULL;
+            postSreqHigh = NULL;
+        }
+    }
 }
 
 #ifdef DEBUG
@@ -233,5 +268,30 @@ BaseDynInst<Impl>::eaSrcsReady()
 
     return true;
 }
+
+/*** [Jiyong,STT] ***/
+template <class Impl>
+bool
+BaseDynInst<Impl>::readyToIssue_UT() const
+{
+    bool ret = status[CanIssue];
+    if (cpu->moreTransmitInsts == 1) {
+        // consider int div and fp div
+        if (opClass() == IntDivOp   ||
+            opClass() == FloatDivOp ||
+            opClass() == FloatSqrtOp)
+            ret = ret && (!instFlags[IsArgsTainted]);
+    }
+    else if (cpu->moreTransmitInsts == 2) {
+        if (opClass() == IntDivOp ||
+            isFloating())
+            ret = ret && (!instFlags[IsArgsTainted]);
+    }
+    else {
+        assert (0);
+    }
+    return ret;
+}
+
 
 #endif//__CPU_BASE_DYN_INST_IMPL_HH__

@@ -229,6 +229,10 @@ class InstructionQueue
     /** Wakes all dependents of a completed instruction. */
     int wakeDependents(DynInstPtr &completed_inst);
 
+    /** [Jiyong, STT] do a scan of instList and wake readyToIssue insts **/
+    /** Used because wakeDependents cannot set readyToIssue if argsTainted **/
+    void wakeUntaintInsts();
+
     /** Adds a ready memory instruction to the ready list. */
     void addReadyMemInst(DynInstPtr &ready_inst);
 
@@ -313,6 +317,9 @@ class InstructionQueue
 
     /** List of all the instructions in the IQ (some of which may be issued). */
     std::list<DynInstPtr> instList[Impl::MaxThreads];
+
+    /*** [Jiyong,STT] List of all stalled tainted ready instructions ***/
+    std::list<DynInstPtr> stalledTaintedInstList[Impl::MaxThreads];
 
     /** List of instructions that are ready to be executed. */
     std::list<DynInstPtr> instsToExecute;
@@ -551,6 +558,9 @@ class InstructionQueue
     Stats::Scalar intAluAccesses;
     Stats::Scalar fpAluAccesses;
     Stats::Scalar vecAluAccesses;
+
+    Stats::Scalar instsSetReady;
+    Stats::Scalar instsStalledBeforeSetReady;
 };
 
 #endif //__CPU_O3_INST_QUEUE_HH__
